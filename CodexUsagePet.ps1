@@ -90,7 +90,7 @@ function New-SessionState {
 $script:projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
-$script:appVersion = '2.8.2'
+$script:appVersion = '2.8.3'
 $script:runtimeLogPath = Join-Path $script:projectRoot 'runtime-error.log'
 trap {
     try {
@@ -877,6 +877,21 @@ Add-Type -AssemblyName System.Drawing
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         ResizeMode="NoResize" MinWidth="220" MinHeight="135" Topmost="True" ShowInTaskbar="False">
   <Grid>
+    <Grid.Resources>
+      <Style x:Key="ResizeThumbStyle" TargetType="{x:Type Thumb}">
+        <Setter Property="Background" Value="#01000000"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Opacity" Value="1"/>
+        <Setter Property="Focusable" Value="False"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="{x:Type Thumb}">
+              <Border Background="{TemplateBinding Background}"/>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+    </Grid.Resources>
     <Border x:Name="RootCard" CornerRadius="20" Background="#F2202634" BorderBrush="#3B82F6" BorderThickness="1.5" Padding="12">
         <Border.Effect>
             <DropShadowEffect Color="#90000000" BlurRadius="24" ShadowDepth="5" Opacity="0.65"/>
@@ -892,13 +907,13 @@ Add-Type -AssemblyName System.Drawing
 
             <Grid x:Name="HeaderPanel" Grid.Row="0">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="46"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="20"/>
-                    <ColumnDefinition Width="20"/>
-                    <ColumnDefinition Width="20"/>
-                    <ColumnDefinition Width="20"/>
-                    <ColumnDefinition Width="20"/>
+                    <ColumnDefinition x:Name="PetColumn" Width="46"/>
+                    <ColumnDefinition x:Name="TitleColumn" Width="*"/>
+                    <ColumnDefinition x:Name="HistoryColumn" Width="20"/>
+                    <ColumnDefinition x:Name="RestoreColumn" Width="20"/>
+                    <ColumnDefinition x:Name="SettingsColumn" Width="20"/>
+                    <ColumnDefinition x:Name="MinimizeColumn" Width="20"/>
+                    <ColumnDefinition x:Name="HideColumn" Width="20"/>
                 </Grid.ColumnDefinitions>
                 <Border x:Name="PetFrame" Width="44" Height="44" CornerRadius="13" Background="Transparent" BorderThickness="0" ToolTip="双击只显示小猫；再次双击恢复详情">
                     <Grid x:Name="PetStage" RenderTransformOrigin="0.5,0.5">
@@ -963,14 +978,14 @@ Add-Type -AssemblyName System.Drawing
             </Grid>
         </Grid>
     </Border>
-    <Thumb x:Name="ResizeLeft" Width="10" HorizontalAlignment="Left" Cursor="SizeWE" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeRight" Width="10" HorizontalAlignment="Right" Cursor="SizeWE" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeTop" Height="10" VerticalAlignment="Top" Cursor="SizeNS" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeBottom" Height="10" VerticalAlignment="Bottom" Cursor="SizeNS" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeTopLeft" Width="22" Height="22" HorizontalAlignment="Left" VerticalAlignment="Top" Cursor="SizeNWSE" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeTopRight" Width="22" Height="22" HorizontalAlignment="Right" VerticalAlignment="Top" Cursor="SizeNESW" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeBottomLeft" Width="22" Height="22" HorizontalAlignment="Left" VerticalAlignment="Bottom" Cursor="SizeNESW" Background="#01000000" Opacity="1" Focusable="False"/>
-    <Thumb x:Name="ResizeBottomRight" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Bottom" Cursor="SizeNWSE" Background="#01000000" Opacity="1" Focusable="False" ToolTip="拖动调整小猫或窗口尺寸"/>
+    <Thumb x:Name="ResizeLeft" Style="{StaticResource ResizeThumbStyle}" Width="10" HorizontalAlignment="Left" Cursor="SizeWE"/>
+    <Thumb x:Name="ResizeRight" Style="{StaticResource ResizeThumbStyle}" Width="10" HorizontalAlignment="Right" Cursor="SizeWE"/>
+    <Thumb x:Name="ResizeTop" Style="{StaticResource ResizeThumbStyle}" Height="10" VerticalAlignment="Top" Cursor="SizeNS"/>
+    <Thumb x:Name="ResizeBottom" Style="{StaticResource ResizeThumbStyle}" Height="10" VerticalAlignment="Bottom" Cursor="SizeNS"/>
+    <Thumb x:Name="ResizeTopLeft" Style="{StaticResource ResizeThumbStyle}" Width="22" Height="22" HorizontalAlignment="Left" VerticalAlignment="Top" Cursor="SizeNWSE"/>
+    <Thumb x:Name="ResizeTopRight" Style="{StaticResource ResizeThumbStyle}" Width="22" Height="22" HorizontalAlignment="Right" VerticalAlignment="Top" Cursor="SizeNESW"/>
+    <Thumb x:Name="ResizeBottomLeft" Style="{StaticResource ResizeThumbStyle}" Width="22" Height="22" HorizontalAlignment="Left" VerticalAlignment="Bottom" Cursor="SizeNESW"/>
+    <Thumb x:Name="ResizeBottomRight" Style="{StaticResource ResizeThumbStyle}" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Bottom" Cursor="SizeNWSE" ToolTip="拖动调整小猫或窗口尺寸"/>
   </Grid>
 </Window>
 '@
@@ -981,6 +996,13 @@ $rootCard = $window.FindName('RootCard')
 $script:normalRootEffect = $rootCard.Effect
 $headerPanel = $window.FindName('HeaderPanel')
 $headerRow = $window.FindName('HeaderRow')
+$petColumn = $window.FindName('PetColumn')
+$titleColumn = $window.FindName('TitleColumn')
+$historyColumn = $window.FindName('HistoryColumn')
+$restoreColumn = $window.FindName('RestoreColumn')
+$settingsColumn = $window.FindName('SettingsColumn')
+$minimizeColumn = $window.FindName('MinimizeColumn')
+$hideColumn = $window.FindName('HideColumn')
 $quotaRow = $window.FindName('QuotaRow')
 $petFrame = $window.FindName('PetFrame')
 $petStage = $window.FindName('PetStage')
@@ -1249,7 +1271,11 @@ function Set-PetOnlyMode {
         $rootCard.BorderThickness = [System.Windows.Thickness]::new(0)
         $rootCard.Padding = [System.Windows.Thickness]::new(5)
         $rootCard.Effect = $null
-        [System.Windows.Controls.Grid]::SetColumnSpan($petFrame, 7)
+        $petColumn.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        foreach ($column in @($titleColumn,$historyColumn,$restoreColumn,$settingsColumn,$minimizeColumn,$hideColumn)) {
+            $column.Width = [System.Windows.GridLength]::new(0)
+        }
+        [System.Windows.Controls.Grid]::SetColumnSpan($petFrame, 1)
         foreach ($thumb in @($resizeLeft,$resizeRight,$resizeTop,$resizeBottom,$resizeTopLeft,$resizeTopRight,$resizeBottomLeft,$resizeBottomRight)) {
             $thumb.Visibility = 'Visible'
         }
@@ -1268,6 +1294,11 @@ function Set-PetOnlyMode {
         $headerPanel.HorizontalAlignment = 'Stretch'
         $petFrame.Width = 44
         $petFrame.Height = 44
+        $petColumn.Width = [System.Windows.GridLength]::new(46)
+        $titleColumn.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        foreach ($column in @($historyColumn,$restoreColumn,$settingsColumn,$minimizeColumn,$hideColumn)) {
+            $column.Width = [System.Windows.GridLength]::new(20)
+        }
         [System.Windows.Controls.Grid]::SetColumnSpan($petFrame, 1)
         $rootCard.Background = Get-PetBrush '#F2202634'
         $rootCard.BorderThickness = [System.Windows.Thickness]::new(1.5)
