@@ -1,0 +1,7 @@
+.pet-settings.json
+.usage-history-cache.json
+.project-lifetime-cache.json
+runtime-error.log
+update.log
+.ui-*.png
+.history-preview*.png
