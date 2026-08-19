@@ -37,7 +37,12 @@ $assets = @(
 foreach ($asset in $assets) { if (-not (Test-Path -LiteralPath $asset)) { throw "缺少发布文件：$asset" } }
 $notesPath = Join-Path $repoRoot ("release-notes-v{0}.md" -f $Version)
 if (-not (Test-Path -LiteralPath $notesPath)) { throw "缺少发布说明：$notesPath" }
-if ((& gh.exe release view $tag --repo $repository --json tagName 2>$null)) { throw "GitHub Release $tag 已存在。" }
+$previousErrorPreference = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+$existingRelease = @(& gh.exe release view $tag --repo $repository --json tagName 2>$null)
+$releaseViewExitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorPreference
+if ($releaseViewExitCode -eq 0 -and $existingRelease.Count -gt 0) { throw "GitHub Release $tag 已存在。" }
 
 $existingTag = [string](& git.exe -C $repoRoot tag --list $tag)
 if ([string]::IsNullOrWhiteSpace($existingTag)) {
