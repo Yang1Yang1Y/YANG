@@ -5,3 +5,6 @@ runtime-error.log
 update.log
 .ui-*.png
 .history-preview*.png
+.update-state.json
+build/
+dist/

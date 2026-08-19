@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $petScript = Join-Path $projectRoot 'CodexUsagePet.ps1'
+$releaseUpdaterScript = Join-Path $projectRoot 'Update-CodexUsagePet.ps1'
 $settingsPath = Join-Path $projectRoot '.pet-settings.json'
 $updateLogPath = Join-Path $projectRoot 'update.log'
 $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -38,11 +39,35 @@ function Get-NormalizedPath {
     return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
 }
 
+function Invoke-ReleasePetUpdate {
+    $result = [pscustomobject]@{ updated = $false; status = 'not_configured'; message = '安装版更新器不存在' }
+    if (-not (Test-Path -LiteralPath $releaseUpdaterScript)) { return $result }
+    try {
+        $arguments = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$releaseUpdaterScript,'-Json')
+        if ($UpdateOnly) { $arguments += '-Force' }
+        $output = @(& $powerShellExe @arguments 2>&1)
+        $jsonLine = [string]($output | Select-Object -Last 1)
+        $releaseResult = $jsonLine | ConvertFrom-Json
+        return [pscustomobject]@{
+            updated = [bool]$releaseResult.updated
+            status = [string]$releaseResult.status
+            message = [string]$releaseResult.message
+        }
+    } catch {
+        $result.status = 'error'
+        $result.message = 'Release 更新检查失败：' + $_.Exception.Message
+        return $result
+    }
+}
+
 function Invoke-SafePetUpdate {
     $result = [pscustomobject]@{ updated = $false; status = 'skipped'; message = '' }
     if ($SkipUpdate -or -not (Get-AutoUpdateEnabled)) {
         $result.message = '自动更新已跳过'
         return $result
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $projectRoot '.git'))) {
+        return Invoke-ReleasePetUpdate
     }
     if ($null -eq (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         $result.status = 'error'; $result.message = '未安装 Git，无法检查更新'

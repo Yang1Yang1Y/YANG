@@ -39,16 +39,20 @@
 
 ## 安装
 
-右键 `Install.ps1`，选择“使用 PowerShell 运行”。安装脚本会：
+推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载 `CodexUsagePet-Setup-v3.0.0.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
 
-1. 在桌面创建“Codex 用量宠物”快捷方式；
-2. 启动桌面宠物；
-3. 不创建系统服务，也不会修改 Codex 配置。
+首个安装版尚未使用商业代码签名证书，Windows SmartScreen 可能显示“未知发布者”。请只从本仓库的 Releases 页面下载，并使用同一版本提供的 `SHA256SUMS.txt` 核对文件。
 
-如果需要开机启动，在 PowerShell 中运行：
+安装向导会创建开始菜单入口，并可选择：
+
+1. 创建桌面快捷方式；
+2. 登录 Windows 后自动启动；
+3. 安装完成后立即启动桌面宠物。
+
+仓库中的 `Install.ps1` 可自动寻找本机构建产物；找不到时会从 GitHub 下载最新安装包：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File .\Install.ps1 -EnableAutoStart
+powershell -ExecutionPolicy Bypass -File .\Install.ps1
 ```
 
 ## 使用
@@ -72,9 +76,9 @@ pwsh -ExecutionPolicy Bypass -File .\Install.ps1 -EnableAutoStart
 
 ## 自动更新
 
-桌面快捷方式现在先运行 `Start-CodexUsagePet.ps1`：检查助手自己的 GitHub `origin`，发现当前分支有可快进更新时先同步文件，再重启助手；没有更新时直接启动。控制中心可关闭启动检查，也可手动点击“检查更新”。检查结果记录在 `update.log`。
+桌面快捷方式先运行 `Start-CodexUsagePet.ps1`。正式安装版通过 GitHub Release 检查更新，不要求电脑安装 Git；发现新版本时会提示用户，确认后下载便携更新包、核对 SHA256、保留本机设置与缓存并重启助手。控制中心可关闭启动检查，也可手动点击“检查更新”。检查结果记录在 `update.log`。
 
-更新器只允许操作“项目目录本身就是 Git 仓库根目录”的仓库。如果目录嵌在其他项目仓库中，它会拒绝拉取，避免错误覆盖其他工程。要启用远程同步，需要把本目录建立为独立仓库，并连接专用 GitHub `origin`。
+源码开发目录仍使用安全的 Git 快进更新，并且只允许操作本项目自己的 `.git`。正式安装目录没有 `.git` 时会自动切换到 Release 更新器。
 
 项目列表不限制项目数量。窗口能容纳多少就直接显示多少，其余项目用鼠标滚轮浏览；滚动条保持隐藏。全部项目都隐藏时，窗口自动缩成只保留标题控制栏和剩余额度的形态。
 
@@ -108,4 +112,14 @@ pwsh -ExecutionPolicy Bypass -File .\CodexUsagePet.ps1 -Once
 
 ## 卸载
 
-运行 `Uninstall.ps1` 会移除桌面快捷方式和开机启动项，不会删除项目目录或 Codex 日志。
+可从 Windows“设置 → 应用 → 已安装的应用”或开始菜单中的“卸载 Codex 用量宠物”完成卸载。卸载会停止助手、移除快捷方式、程序设置与派生缓存，但不会删除 `%USERPROFILE%\.codex` 中的 Codex 原始日志。
+
+## 构建与发布
+
+安装 Inno Setup 6 后执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Build-Release.ps1
+```
+
+构建会在 `dist` 生成安装包、便携 ZIP、发布清单和 SHA256 校验文件。维护者可在干净且已同步的 `main` 分支执行 `scripts\Publish-Release.ps1` 创建版本标签并发布 GitHub Release。

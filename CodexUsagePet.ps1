@@ -90,7 +90,17 @@ function New-SessionState {
 $script:projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
-$script:appVersion = '2.8.4'
+$script:releaseUpdaterPath = Join-Path $script:projectRoot 'Update-CodexUsagePet.ps1'
+$script:versionInfoPath = Join-Path $script:projectRoot 'version.json'
+$script:appVersion = '3.0.0'
+try {
+    if (Test-Path -LiteralPath $script:versionInfoPath) {
+        $versionInfo = Get-Content -Raw -Encoding UTF8 -LiteralPath $script:versionInfoPath | ConvertFrom-Json
+        if (-not [string]::IsNullOrWhiteSpace([string]$versionInfo.version)) {
+            $script:appVersion = [string]$versionInfo.version
+        }
+    }
+} catch {}
 $script:runtimeLogPath = Join-Path $script:projectRoot 'runtime-error.log'
 trap {
     try {
@@ -1348,7 +1358,8 @@ function Set-PetAutoStart {
         $startupScript = if (Test-Path -LiteralPath $script:launcherScriptPath) { $script:launcherScriptPath } else { $script:petScriptPath }
         $shortcut.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$startupScript`""
         $shortcut.WorkingDirectory = $script:projectRoot
-        $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
+        $appIconPath = Join-Path $script:projectRoot 'assets\app.ico'
+        $shortcut.IconLocation = if (Test-Path -LiteralPath $appIconPath) { $appIconPath } else { "$env:SystemRoot\System32\shell32.dll,13" }
         $shortcut.Description = '登录 Windows 后启动 Codex 用量宠物'
         $shortcut.Save()
     } elseif (Test-Path -LiteralPath $script:autoStartShortcutPath) {
@@ -1387,7 +1398,7 @@ function Start-PetUpdateCheck {
                 $lastLine = [string](Get-Content -LiteralPath $updateLogPath -Encoding UTF8 -Tail 1)
                 $message = if ($lastLine -match '^\[[^\]]+\]\s*(.+)$') { $Matches[1] } else { $lastLine }
                 $script:updateStatus.Text = $message
-                $script:updateStatus.Foreground = Get-PetBrush $(if ($message -match '最新版本|已自动更新') { '#4FD19A' } elseif ($message -match '尚未|禁止|跳过|未连接|本地修改') { '#FBBF24' } else { '#F87171' })
+                $script:updateStatus.Foreground = Get-PetBrush $(if ($message -match '最新版本|已自动更新|已更新') { '#4FD19A' } elseif ($message -match '尚未|禁止|跳过|未连接|本地修改|暂不更新|不足 6 小时') { '#FBBF24' } else { '#F87171' })
                 $script:updateCheckTimer.Stop()
             })
         }
@@ -1403,6 +1414,12 @@ function Start-PetUpdateCheck {
 function Get-PetUpdateConnectionStatus {
     if (-not (Test-Path -LiteralPath $script:launcherScriptPath)) {
         return [pscustomobject]@{ status = 'FAIL'; detail = '缺少 Start-CodexUsagePet.ps1' }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $script:projectRoot '.git'))) {
+        if ((Test-Path -LiteralPath $script:releaseUpdaterPath) -and (Test-Path -LiteralPath $script:versionInfoPath)) {
+            return [pscustomobject]@{ status = 'PASS'; detail = 'GitHub Release 更新器 · 当前版本 ' + $script:appVersion }
+        }
+        return [pscustomobject]@{ status = 'FAIL'; detail = '安装版更新器或版本文件缺失' }
     }
     if ($null -eq (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         return [pscustomobject]@{ status = 'FAIL'; detail = '未安装 Git' }
