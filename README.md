@@ -10,8 +10,8 @@
 - 项目列表按“项目创建以来全部累计 Token”从高到低排列，累计最多的位于最上方
 - 每个项目同时显示本轮与今日累计 Token；点击“累计”可切换为项目创建以来的全部历史 Token
 - 每个项目可独立隐藏；检测到同项目新的任务或会话后自动重新显示
-- 单击项目行可直接跳转到对应的 Codex 任务
-- 项目从工作状态转为完成/待命时发送 Windows 通知
+- 双击项目行可直接跳转到对应的 Codex 任务，单击不会误跳转
+- 项目从工作状态转为完成/待命时发送 Windows 通知，并在小猫旁显示可关闭、可点击跳转的完成气泡
 - 独立的项目全生命周期用量排行，显示 Token 总量及占全部项目的比例
 - 当前会话累计 Token（包含重复处理的输入、缓存输入与输出）
 - 今天累计 Token
@@ -39,7 +39,7 @@
 
 ## 安装
 
-推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载 `CodexUsagePet-Setup-v3.0.0.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
+推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载最新版 `CodexUsagePet-Setup-v3.1.0.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
 
 首个安装版尚未使用商业代码签名证书，Windows SmartScreen 可能显示“未知发布者”。请只从本仓库的 Releases 页面下载，并使用同一版本提供的 `SHA256SUMS.txt` 核对文件。
 
@@ -65,7 +65,8 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 - 点击右上角 —：最小化（双击托盘图标或桌面快捷方式恢复）
 - 点击右上角 ×：隐藏到系统托盘
 - 点击项目行右侧 ×：仅隐藏该项目监控行，不会停止 Codex 任务；新对话会自动恢复
-- 单击项目行：在 Codex 桌面端打开该项目最近的任务
+- 双击项目行：在 Codex 桌面端打开该项目最近的任务；单击只用于选中，不会跳转
+- 点击完成气泡：打开刚完成的对应任务；点击气泡右上角 × 可只关闭该条提示
 - 双击托盘图标：显示/隐藏
 - 点击标题栏 `↺`：立即恢复全部隐藏项目
 - 点击标题栏 `⚙`：打开控制中心设置页
@@ -88,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File .\Install.ps1
 
 “项目累计”按 Codex 项目的当前根目录归类，只改项目显示名不会把历史用量拆成两份。首次点击会建立 `.project-lifetime-cache.json`，以后直接读取缓存，并用正在运行的会话数据更新当前结果。
 
-项目排行按创建以来的累计 Token 从高到低排列，并计算每个项目占所有已识别项目累计用量的比例。排行中的项目也可以单击跳转。
+项目排行按创建以来的累计 Token 从高到低排列，并计算每个项目占所有已识别项目累计用量的比例。排行中的项目也可以双击跳转。
 
 版本与自检位于控制中心第三页。绿色表示正常，黄色表示可选功能未启用或 Codex 当前未运行，红色表示需要处理的异常。
 

@@ -92,7 +92,7 @@ $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
 $script:releaseUpdaterPath = Join-Path $script:projectRoot 'Update-CodexUsagePet.ps1'
 $script:versionInfoPath = Join-Path $script:projectRoot 'version.json'
-$script:appVersion = '3.0.0'
+$script:appVersion = '3.1.0'
 try {
     if (Test-Path -LiteralPath $script:versionInfoPath) {
         $versionInfo = Get-Content -Raw -Encoding UTF8 -LiteralPath $script:versionInfoPath | ConvertFrom-Json
@@ -1109,6 +1109,12 @@ $script:lastPetClickAt = [DateTime]::MinValue
 $script:lastPetClickCursor = $null
 $script:projectActivityStates = @{}
 $script:activityStateInitialized = $false
+$script:completionBubbleQueue = New-Object System.Collections.ArrayList
+$script:currentCompletionBubble = $null
+$script:completionBubbleWindow = $null
+$script:completionBubbleTitle = $null
+$script:completionBubbleProject = $null
+$script:completionBubbleHint = $null
 $script:codexProcessLastChecked = [DateTimeOffset]::MinValue
 $script:codexProcessRunning = $false
 $script:updateCheckTimer = $null
@@ -1349,6 +1355,155 @@ function Open-CodexThread {
     }
 }
 
+function Update-CompletionBubblePosition {
+    if ($null -eq $script:completionBubbleWindow -or -not $script:completionBubbleWindow.IsVisible) { return }
+    try {
+        $handle = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
+        $screen = [System.Windows.Forms.Screen]::FromHandle($handle)
+        $workArea = $screen.WorkingArea
+        $source = [System.Windows.PresentationSource]::FromVisual($window)
+        if ($null -ne $source -and $null -ne $source.CompositionTarget) {
+            $fromDevice = $source.CompositionTarget.TransformFromDevice
+            $topLeft = $fromDevice.Transform([System.Windows.Point]::new($workArea.Left, $workArea.Top))
+            $bottomRight = $fromDevice.Transform([System.Windows.Point]::new($workArea.Right, $workArea.Bottom))
+        } else {
+            $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window)
+            $topLeft = [System.Windows.Point]::new($workArea.Left / $dpi.DpiScaleX, $workArea.Top / $dpi.DpiScaleY)
+            $bottomRight = [System.Windows.Point]::new($workArea.Right / $dpi.DpiScaleX, $workArea.Bottom / $dpi.DpiScaleY)
+        }
+
+        $petWidth = if ($window.ActualWidth -gt 0) { [double]$window.ActualWidth } else { [double]$window.Width }
+        $petHeight = if ($window.ActualHeight -gt 0) { [double]$window.ActualHeight } else { [double]$window.Height }
+        $bubbleWidth = [double]$script:completionBubbleWindow.Width
+        $bubbleHeight = [double]$script:completionBubbleWindow.Height
+        $left = [double]$window.Left + $petWidth + 8
+        if ($left + $bubbleWidth -gt $bottomRight.X - 4) {
+            $left = [double]$window.Left - $bubbleWidth - 8
+        }
+        $left = [Math]::Max($topLeft.X + 4, [Math]::Min($bottomRight.X - $bubbleWidth - 4, $left))
+        $top = [double]$window.Top + [Math]::Min(12, $petHeight / 4)
+        $top = [Math]::Max($topLeft.Y + 4, [Math]::Min($bottomRight.Y - $bubbleHeight - 4, $top))
+        $script:completionBubbleWindow.Left = $left
+        $script:completionBubbleWindow.Top = $top
+    } catch {}
+}
+
+function Initialize-CompletionBubble {
+    if ($null -ne $script:completionBubbleWindow) { return }
+    [xml]$bubbleXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Codex 完成提示" Width="248" Height="94"
+        WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True"
+        Background="Transparent" ShowInTaskbar="False" ShowActivated="False"
+        Topmost="True" WindowStartupLocation="Manual">
+  <Grid Background="Transparent">
+    <Polygon Points="28,73 45,73 33,92" Fill="#F21A2232" Stroke="#4FD19A" StrokeThickness="1.2" />
+    <Border x:Name="BubbleCard" Margin="0,0,0,13" Padding="13,10,8,9" CornerRadius="15"
+            Background="#F21A2232" BorderBrush="#4FD19A" BorderThickness="1.2" Cursor="Hand">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="27" />
+        </Grid.ColumnDefinitions>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock x:Name="BubbleTitle" Foreground="#EAFBF4" FontSize="13" FontWeight="SemiBold"
+                     TextTrimming="CharacterEllipsis" />
+          <TextBlock x:Name="BubbleProject" Margin="0,2,0,0" Foreground="#B8C7DC" FontSize="11"
+                     TextTrimming="CharacterEllipsis" />
+          <TextBlock x:Name="BubbleHint" Margin="0,2,0,0" Foreground="#91A0B8" FontSize="10" />
+        </StackPanel>
+        <Button x:Name="BubbleClose" Grid.Column="1" Content="×" Width="24" Height="24"
+                VerticalAlignment="Top" Background="Transparent" BorderThickness="0"
+                Foreground="#A9B6CA" FontSize="17" Cursor="Hand" ToolTip="关闭这条完成提示" />
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
+'@
+    $reader = New-Object System.Xml.XmlNodeReader $bubbleXaml
+    $script:completionBubbleWindow = [Windows.Markup.XamlReader]::Load($reader)
+    $script:completionBubbleTitle = $script:completionBubbleWindow.FindName('BubbleTitle')
+    $script:completionBubbleProject = $script:completionBubbleWindow.FindName('BubbleProject')
+    $script:completionBubbleHint = $script:completionBubbleWindow.FindName('BubbleHint')
+    $bubbleCard = $script:completionBubbleWindow.FindName('BubbleCard')
+    $bubbleClose = $script:completionBubbleWindow.FindName('BubbleClose')
+
+    $bubbleClose.Add_Click({
+        param($sender, $eventArgs)
+        $eventArgs.Handled = $true
+        Dismiss-CompletionBubble $true
+    })
+    $bubbleCard.Add_MouseLeftButtonUp({
+        param($sender, $eventArgs)
+        $source = $eventArgs.OriginalSource
+        while ($null -ne $source -and $source -ne $sender) {
+            if ($source -is [System.Windows.Controls.Button]) { return }
+            try { $source = [System.Windows.Media.VisualTreeHelper]::GetParent($source) } catch { break }
+        }
+        if ($null -eq $script:currentCompletionBubble) { return }
+        $entry = $script:currentCompletionBubble
+        Dismiss-CompletionBubble $false
+        Open-CodexThread ([string]$entry.session_id) ([string]$entry.project_name)
+        Show-NextCompletionBubble
+        $eventArgs.Handled = $true
+    })
+    $script:completionBubbleWindow.Add_Closing({
+        param($sender, $eventArgs)
+        if (-not $script:isExiting) {
+            $eventArgs.Cancel = $true
+            Dismiss-CompletionBubble $true
+        }
+    })
+}
+
+function Show-NextCompletionBubble {
+    if ($null -eq $script:currentCompletionBubble) {
+        if ($script:completionBubbleQueue.Count -eq 0) { return }
+        $script:currentCompletionBubble = $script:completionBubbleQueue[0]
+        $script:completionBubbleQueue.RemoveAt(0)
+    }
+    if (-not $window.IsVisible) { return }
+
+    Initialize-CompletionBubble
+    $entry = $script:currentCompletionBubble
+    $script:completionBubbleTitle.Text = '✓ 任务弄好了'
+    $script:completionBubbleProject.Text = [string]$entry.project_name
+    $remaining = $script:completionBubbleQueue.Count
+    $script:completionBubbleHint.Text = if ($remaining -gt 0) { "点击打开对应对话 · 还有 $remaining 条" } else { '点击打开对应对话' }
+    $script:completionBubbleWindow.Topmost = $script:topmostEnabled
+    $script:completionBubbleWindow.Opacity = [double]$script:windowOpacityPercent / 100.0
+    if (-not $script:completionBubbleWindow.IsVisible) { $script:completionBubbleWindow.Show() }
+    Update-CompletionBubblePosition
+}
+
+function Dismiss-CompletionBubble {
+    param([bool]$ShowNext = $true)
+    if ($null -ne $script:completionBubbleWindow -and $script:completionBubbleWindow.IsVisible) {
+        $script:completionBubbleWindow.Hide()
+    }
+    $script:currentCompletionBubble = $null
+    if ($ShowNext) { Show-NextCompletionBubble }
+}
+
+function Queue-CompletionBubble {
+    param($Project)
+    $sessionId = [string]$Project.session_id
+    $projectKey = [string]$Project.project_key
+    if ($null -ne $script:currentCompletionBubble -and
+        [string]$script:currentCompletionBubble.project_key -eq $projectKey -and
+        [string]$script:currentCompletionBubble.session_id -eq $sessionId) { return }
+    foreach ($pending in @($script:completionBubbleQueue)) {
+        if ([string]$pending.project_key -eq $projectKey -and [string]$pending.session_id -eq $sessionId) { return }
+    }
+    [void]$script:completionBubbleQueue.Add([pscustomobject]@{
+        project_key = $projectKey
+        project_name = [string]$Project.project_name
+        session_id = $sessionId
+    })
+    Show-NextCompletionBubble
+}
+
 function Set-PetAutoStart {
     param([bool]$Enabled)
     if ($Enabled) {
@@ -1501,8 +1656,14 @@ function Check-ProjectCompletionNotifications {
         $active = [bool]$project.active
         if ($script:activityStateInitialized -and $script:projectActivityStates.ContainsKey($key) -and
             [bool]$script:projectActivityStates[$key] -and -not $active -and $script:notifyOnCompletion) {
+            if (-not [bool]$Metrics.active -and $script:idleCatFrames.Count -gt 0) {
+                $petSprite.Source = $script:idleCatFrames[0]
+                $petBounce.X = 0
+                $petBounce.Y = 0
+            }
+            Queue-CompletionBubble $project
             $notifyIcon.BalloonTipTitle = 'Codex 任务已完成'
-            $notifyIcon.BalloonTipText = ([string]$project.project_name) + '已从工作中转为待命，点击项目可回到对应任务。'
+            $notifyIcon.BalloonTipText = ([string]$project.project_name) + '已从工作中转为待命，双击项目可回到对应任务。'
             $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
             $notifyIcon.ShowBalloonTip(9000)
         }
@@ -1584,9 +1745,10 @@ function New-ProjectStatusRow {
     $border.Margin = [System.Windows.Thickness]::new(0,0,0,4)
     $border.Tag = $Project
     $border.Cursor = 'Hand'
-    $border.ToolTip = ([string]$Project.project_path) + "`n项目累计 " + (Format-TokenCount $Project.lifetime.total_tokens) + "`n当前会话 " + (Format-TokenCount $Project.session.total_tokens) + "`n单击打开对应 Codex 任务"
-    $border.Add_MouseLeftButtonUp({
+    $border.ToolTip = ([string]$Project.project_path) + "`n项目累计 " + (Format-TokenCount $Project.lifetime.total_tokens) + "`n当前会话 " + (Format-TokenCount $Project.session.total_tokens) + "`n双击打开对应 Codex 任务"
+    $border.Add_MouseLeftButtonDown({
         param($sender, $eventArgs)
+        if ($eventArgs.ClickCount -lt 2) { return }
         $source = $eventArgs.OriginalSource
         while ($null -ne $source -and $source -ne $sender) {
             if ($source -is [System.Windows.Controls.Button]) { return }
@@ -1965,6 +2127,10 @@ function Save-ControlCenterSettings {
         $window.Topmost = $script:topmostEnabled
         $window.Opacity = [double]$script:windowOpacityPercent / 100.0
         $script:controlCenterWindow.Topmost = $script:topmostEnabled
+        if ($null -ne $script:completionBubbleWindow) {
+            $script:completionBubbleWindow.Topmost = $script:topmostEnabled
+            $script:completionBubbleWindow.Opacity = [double]$script:windowOpacityPercent / 100.0
+        }
         $refreshTimer.Interval = [TimeSpan]::FromSeconds($script:refreshSeconds)
         Set-PetAutoStart ([bool]$script:autoStartCheck.IsChecked)
         Save-PetPosition
@@ -1988,7 +2154,7 @@ function New-RankingRow {
     $border.Margin = [System.Windows.Thickness]::new(0,0,0,6)
     $border.Cursor = 'Hand'
     $border.Tag = $Item
-    $border.ToolTip = ([string]$Item.project_path) + "`n单击打开该项目最近的 Codex 任务"
+    $border.ToolTip = ([string]$Item.project_path) + "`n双击打开该项目最近的 Codex 任务"
 
     $panel = New-Object System.Windows.Controls.StackPanel
     $header = New-Object System.Windows.Controls.Grid
@@ -2031,8 +2197,9 @@ function New-RankingRow {
     $track.Child = $barGrid
     [void]$panel.Children.Add($track)
     $border.Child = $panel
-    $border.Add_MouseLeftButtonUp({
+    $border.Add_MouseLeftButtonDown({
         param($sender, $eventArgs)
+        if ($eventArgs.ClickCount -lt 2) { return }
         $item = $sender.Tag
         Open-CodexThread ([string]$item.session_id) ([string]$item.project_name)
         $eventArgs.Handled = $true
@@ -2390,8 +2557,25 @@ $rootCard.Add_MouseLeftButtonDown({
     }
     try { $window.DragMove() } catch {}
 })
-$hideButton.Add_Click({ Save-PetPosition; $window.Hide() })
-$minimizeButton.Add_Click({ Save-PetPosition; $window.WindowState = 'Minimized' })
+$window.Add_LocationChanged({ Update-CompletionBubblePosition })
+$window.Add_SizeChanged({ Update-CompletionBubblePosition })
+$window.Add_StateChanged({
+    if ($window.WindowState -eq 'Minimized') {
+        if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+    } elseif ($window.IsVisible) {
+        Show-NextCompletionBubble
+    }
+})
+$hideButton.Add_Click({
+    Save-PetPosition
+    if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+    $window.Hide()
+})
+$minimizeButton.Add_Click({
+    Save-PetPosition
+    if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+    $window.WindowState = 'Minimized'
+})
 $historyButton.Add_Click({ Show-HistoryWindow })
 $restoreProjectsButton.Add_Click({ Restore-AllProjectRows })
 $detailToggleButton.Add_Click({ Toggle-PetCompact })
@@ -2513,13 +2697,16 @@ $showAction = {
         $window.WindowState = 'Normal'
         if (-not $window.IsVisible) { $window.Show() }
         $window.Activate()
+        Show-NextCompletionBubble
     } elseif ($window.IsVisible) {
         Save-PetPosition
+        if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
         $window.Hide()
     } else {
         $window.WindowState = 'Normal'
         $window.Show()
         $window.Activate()
+        Show-NextCompletionBubble
     }
 }
 $showItem.Add_Click($showAction)
@@ -2537,6 +2724,7 @@ $exitItem.Add_Click({
     $notifyIcon.Dispose()
     if ($null -ne $script:controlCenterWindow) { $script:controlCenterWindow.Close() }
     if ($null -ne $script:historyWindow) { $script:historyWindow.Close() }
+    if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Close() }
     $window.Close()
     $window.Dispatcher.InvokeShutdown()
 })
@@ -2546,6 +2734,7 @@ $window.Add_Closing({
     if (-not $script:isExiting) {
         $eventArgs.Cancel = $true
         Save-PetPosition
+        if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
         $window.Hide()
     }
 })
@@ -2569,6 +2758,7 @@ $wakeTimer.Add_Tick({
         $window.Activate()
         $window.Topmost = $false
         $window.Topmost = $true
+        Show-NextCompletionBubble
     }
 })
 
@@ -2636,6 +2826,10 @@ try {
     if ($null -ne $script:controlCenterWindow) {
         $script:isExiting = $true
         $script:controlCenterWindow.Close()
+    }
+    if ($null -ne $script:completionBubbleWindow) {
+        $script:isExiting = $true
+        $script:completionBubbleWindow.Close()
     }
     if ($null -ne $notifyIcon) {
         $notifyIcon.Visible = $false
