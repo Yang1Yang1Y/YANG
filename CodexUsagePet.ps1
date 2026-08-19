@@ -90,7 +90,7 @@ function New-SessionState {
 $script:projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
-$script:appVersion = '2.8.1'
+$script:appVersion = '2.8.2'
 $script:runtimeLogPath = Join-Path $script:projectRoot 'runtime-error.log'
 trap {
     try {
@@ -963,14 +963,14 @@ Add-Type -AssemblyName System.Drawing
             </Grid>
         </Grid>
     </Border>
-    <Thumb x:Name="ResizeLeft" Width="7" HorizontalAlignment="Left" Cursor="SizeWE" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeRight" Width="7" HorizontalAlignment="Right" Cursor="SizeWE" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeTop" Height="7" VerticalAlignment="Top" Cursor="SizeNS" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeBottom" Height="7" VerticalAlignment="Bottom" Cursor="SizeNS" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeTopLeft" Width="14" Height="14" HorizontalAlignment="Left" VerticalAlignment="Top" Cursor="SizeNWSE" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeTopRight" Width="14" Height="14" HorizontalAlignment="Right" VerticalAlignment="Top" Cursor="SizeNESW" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeBottomLeft" Width="14" Height="14" HorizontalAlignment="Left" VerticalAlignment="Bottom" Cursor="SizeNESW" Opacity="0" Focusable="False"/>
-    <Thumb x:Name="ResizeBottomRight" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Cursor="SizeNWSE" Opacity="0" Focusable="False" ToolTip="拖动自由调整宽度和高度"/>
+    <Thumb x:Name="ResizeLeft" Width="10" HorizontalAlignment="Left" Cursor="SizeWE" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeRight" Width="10" HorizontalAlignment="Right" Cursor="SizeWE" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeTop" Height="10" VerticalAlignment="Top" Cursor="SizeNS" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeBottom" Height="10" VerticalAlignment="Bottom" Cursor="SizeNS" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeTopLeft" Width="22" Height="22" HorizontalAlignment="Left" VerticalAlignment="Top" Cursor="SizeNWSE" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeTopRight" Width="22" Height="22" HorizontalAlignment="Right" VerticalAlignment="Top" Cursor="SizeNESW" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeBottomLeft" Width="22" Height="22" HorizontalAlignment="Left" VerticalAlignment="Bottom" Cursor="SizeNESW" Background="#01000000" Opacity="1" Focusable="False"/>
+    <Thumb x:Name="ResizeBottomRight" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Bottom" Cursor="SizeNWSE" Background="#01000000" Opacity="1" Focusable="False" ToolTip="拖动调整小猫或窗口尺寸"/>
   </Grid>
 </Window>
 '@
