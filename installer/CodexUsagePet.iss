@@ -1,5 +1,5 @@
 ﻿#ifndef MyAppVersion
-  #define MyAppVersion "3.1.0"
+  #define MyAppVersion "3.1.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\build\CodexUsagePet"
