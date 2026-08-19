@@ -92,7 +92,7 @@ $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
 $script:releaseUpdaterPath = Join-Path $script:projectRoot 'Update-CodexUsagePet.ps1'
 $script:versionInfoPath = Join-Path $script:projectRoot 'version.json'
-$script:appVersion = '3.1.0'
+$script:appVersion = '3.1.1'
 try {
     if (Test-Path -LiteralPath $script:versionInfoPath) {
         $versionInfo = Get-Content -Raw -Encoding UTF8 -LiteralPath $script:versionInfoPath | ConvertFrom-Json
@@ -1112,6 +1112,8 @@ $script:activityStateInitialized = $false
 $script:completionBubbleQueue = New-Object System.Collections.ArrayList
 $script:currentCompletionBubble = $null
 $script:completionBubbleWindow = $null
+$script:completionBubbleCard = $null
+$script:completionBubbleTail = $null
 $script:completionBubbleTitle = $null
 $script:completionBubbleProject = $null
 $script:completionBubbleHint = $null
@@ -1355,6 +1357,25 @@ function Open-CodexThread {
     }
 }
 
+function Set-CompletionBubbleTailDirection {
+    param([bool]$BubbleOnLeft)
+    if ($null -eq $script:completionBubbleCard -or $null -eq $script:completionBubbleTail) { return }
+
+    $points = New-Object System.Windows.Media.PointCollection
+    if ($BubbleOnLeft) {
+        $script:completionBubbleCard.Margin = [System.Windows.Thickness]::new(0,0,14,0)
+        [void]$points.Add([System.Windows.Point]::new(245,35))
+        [void]$points.Add([System.Windows.Point]::new(245,59))
+        [void]$points.Add([System.Windows.Point]::new(259,47))
+    } else {
+        $script:completionBubbleCard.Margin = [System.Windows.Thickness]::new(14,0,0,0)
+        [void]$points.Add([System.Windows.Point]::new(15,35))
+        [void]$points.Add([System.Windows.Point]::new(15,59))
+        [void]$points.Add([System.Windows.Point]::new(1,47))
+    }
+    $script:completionBubbleTail.Points = $points
+}
+
 function Update-CompletionBubblePosition {
     if ($null -eq $script:completionBubbleWindow -or -not $script:completionBubbleWindow.IsVisible) { return }
     try {
@@ -1372,17 +1393,25 @@ function Update-CompletionBubblePosition {
             $bottomRight = [System.Windows.Point]::new($workArea.Right / $dpi.DpiScaleX, $workArea.Bottom / $dpi.DpiScaleY)
         }
 
-        $petWidth = if ($window.ActualWidth -gt 0) { [double]$window.ActualWidth } else { [double]$window.Width }
-        $petHeight = if ($window.ActualHeight -gt 0) { [double]$window.ActualHeight } else { [double]$window.Height }
+        $petOrigin = $petFrame.TranslatePoint([System.Windows.Point]::new(0,0), $window)
+        $catLeft = [double]$window.Left + $petOrigin.X
+        $catTop = [double]$window.Top + $petOrigin.Y
+        $catWidth = if ($petFrame.ActualWidth -gt 0) { [double]$petFrame.ActualWidth } else { [double]$petFrame.Width }
+        $catHeight = if ($petFrame.ActualHeight -gt 0) { [double]$petFrame.ActualHeight } else { [double]$petFrame.Height }
         $bubbleWidth = [double]$script:completionBubbleWindow.Width
         $bubbleHeight = [double]$script:completionBubbleWindow.Height
-        $left = [double]$window.Left + $petWidth + 8
-        if ($left + $bubbleWidth -gt $bottomRight.X - 4) {
-            $left = [double]$window.Left - $bubbleWidth - 8
+
+        $rightCandidate = $catLeft + $catWidth - 2
+        $bubbleOnLeft = ($rightCandidate + $bubbleWidth -gt $bottomRight.X - 4)
+        if ($bubbleOnLeft) {
+            $left = $catLeft - $bubbleWidth + 2
+        } else {
+            $left = $rightCandidate
         }
         $left = [Math]::Max($topLeft.X + 4, [Math]::Min($bottomRight.X - $bubbleWidth - 4, $left))
-        $top = [double]$window.Top + [Math]::Min(12, $petHeight / 4)
+        $top = $catTop + (($catHeight - $bubbleHeight) / 2)
         $top = [Math]::Max($topLeft.Y + 4, [Math]::Min($bottomRight.Y - $bubbleHeight - 4, $top))
+        Set-CompletionBubbleTailDirection $bubbleOnLeft
         $script:completionBubbleWindow.Left = $left
         $script:completionBubbleWindow.Top = $top
     } catch {}
@@ -1393,29 +1422,30 @@ function Initialize-CompletionBubble {
     [xml]$bubbleXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Codex 完成提示" Width="248" Height="94"
+        Title="Codex 完成提示" Width="260" Height="94"
         WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True"
         Background="Transparent" ShowInTaskbar="False" ShowActivated="False"
         Topmost="True" WindowStartupLocation="Manual">
   <Grid Background="Transparent">
-    <Polygon Points="28,73 45,73 33,92" Fill="#F21A2232" Stroke="#4FD19A" StrokeThickness="1.2" />
-    <Border x:Name="BubbleCard" Margin="0,0,0,13" Padding="13,10,8,9" CornerRadius="15"
-            Background="#F21A2232" BorderBrush="#4FD19A" BorderThickness="1.2" Cursor="Hand">
+    <Polygon x:Name="BubbleTail" Points="245,35 245,59 259,47" Fill="#FFFFFFFF"
+             Stroke="#CBD5E1" StrokeThickness="1.2" StrokeLineJoin="Round" />
+    <Border x:Name="BubbleCard" Margin="0,0,14,0" Padding="15,11,10,10" CornerRadius="22"
+            Background="#FFFFFFFF" BorderBrush="#CBD5E1" BorderThickness="1.2" Cursor="Hand">
       <Grid>
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*" />
           <ColumnDefinition Width="27" />
         </Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment="Center">
-          <TextBlock x:Name="BubbleTitle" Foreground="#EAFBF4" FontSize="13" FontWeight="SemiBold"
+          <TextBlock x:Name="BubbleTitle" Foreground="#1F2937" FontSize="13" FontWeight="SemiBold"
                      TextTrimming="CharacterEllipsis" />
-          <TextBlock x:Name="BubbleProject" Margin="0,2,0,0" Foreground="#B8C7DC" FontSize="11"
+          <TextBlock x:Name="BubbleProject" Margin="0,2,0,0" Foreground="#475569" FontSize="11"
                      TextTrimming="CharacterEllipsis" />
-          <TextBlock x:Name="BubbleHint" Margin="0,2,0,0" Foreground="#91A0B8" FontSize="10" />
+          <TextBlock x:Name="BubbleHint" Margin="0,2,0,0" Foreground="#8491A3" FontSize="10" />
         </StackPanel>
         <Button x:Name="BubbleClose" Grid.Column="1" Content="×" Width="24" Height="24"
                 VerticalAlignment="Top" Background="Transparent" BorderThickness="0"
-                Foreground="#A9B6CA" FontSize="17" Cursor="Hand" ToolTip="关闭这条完成提示" />
+                Foreground="#64748B" FontSize="17" Cursor="Hand" ToolTip="关闭这条完成提示" />
       </Grid>
     </Border>
   </Grid>
@@ -1423,10 +1453,12 @@ function Initialize-CompletionBubble {
 '@
     $reader = New-Object System.Xml.XmlNodeReader $bubbleXaml
     $script:completionBubbleWindow = [Windows.Markup.XamlReader]::Load($reader)
+    $script:completionBubbleCard = $script:completionBubbleWindow.FindName('BubbleCard')
+    $script:completionBubbleTail = $script:completionBubbleWindow.FindName('BubbleTail')
     $script:completionBubbleTitle = $script:completionBubbleWindow.FindName('BubbleTitle')
     $script:completionBubbleProject = $script:completionBubbleWindow.FindName('BubbleProject')
     $script:completionBubbleHint = $script:completionBubbleWindow.FindName('BubbleHint')
-    $bubbleCard = $script:completionBubbleWindow.FindName('BubbleCard')
+    $bubbleCard = $script:completionBubbleCard
     $bubbleClose = $script:completionBubbleWindow.FindName('BubbleClose')
 
     $bubbleClose.Add_Click({

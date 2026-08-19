@@ -39,7 +39,7 @@
 
 ## 安装
 
-推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载最新版 `CodexUsagePet-Setup-v3.1.0.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
+推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载最新版 `CodexUsagePet-Setup-v3.1.1.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
 
 首个安装版尚未使用商业代码签名证书，Windows SmartScreen 可能显示“未知发布者”。请只从本仓库的 Releases 页面下载，并使用同一版本提供的 `SHA256SUMS.txt` 核对文件。
 
