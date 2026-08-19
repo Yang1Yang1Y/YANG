@@ -90,7 +90,7 @@ function New-SessionState {
 $script:projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
-$script:appVersion = '2.8.3'
+$script:appVersion = '2.8.4'
 $script:runtimeLogPath = Join-Path $script:projectRoot 'runtime-error.log'
 trap {
     try {
@@ -1058,7 +1058,7 @@ $catAssetRoot = Join-Path $script:projectRoot 'assets\cat'
 $script:busyCatFrames = @(1..4 | ForEach-Object { Import-PetBitmap (Join-Path $catAssetRoot ("cat-busy-$_.png")) })
 $script:idleCatFrames = @(1..4 | ForEach-Object { Import-PetBitmap (Join-Path $catAssetRoot ("cat-idle-$_.png")) })
 
-$script:isCompact = $false
+$script:isCompact = $true
 $script:isExiting = $false
 $script:alerted80 = $false
 $script:alerted90 = $false
