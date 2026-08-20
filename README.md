@@ -23,7 +23,7 @@
 - 6 周每日用量热力日历
 - 额度已使用 80% 和 90% 时分别通知（每个额度周期只提醒一次）
 - 主窗口实时显示“数据正常 / 更新延迟 / Codex 未运行 / 数据异常”健康状态
-- 控制中心可调整刷新间隔、排序方式、动画速度、窗口透明度、通知、置顶和开机启动
+- 控制中心可调整刷新间隔、排序方式、动画速度、窗口透明度、通知、完成气泡停留时间、置顶和开机启动
 - 控制中心支持启动自动更新和手动“检查更新”
 - 版本与自检页可检查日志、项目名称映射、Codex 跳转协议、累计缓存、动画资源及错误日志
 - 工作时显示小猫快速挥爪敲键盘动画，待命时显示小猫趴下打盹和 `z/Z` 呼吸动画
@@ -39,7 +39,7 @@
 
 ## 安装
 
-推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载最新版 `CodexUsagePet-Setup-v3.1.1.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
+推荐从 [Releases](https://github.com/Yang1Yang1Y/YANG/releases) 下载最新版 `CodexUsagePet-Setup-v3.1.2.exe`。安装向导允许用户选择安装目录，默认安装到 `%LOCALAPPDATA%\Programs\Codex Usage Pet`，无需管理员权限。
 
 首个安装版尚未使用商业代码签名证书，Windows SmartScreen 可能显示“未知发布者”。请只从本仓库的 Releases 页面下载，并使用同一版本提供的 `SHA256SUMS.txt` 核对文件。
 

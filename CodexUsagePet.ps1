@@ -92,7 +92,7 @@ $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
 $script:releaseUpdaterPath = Join-Path $script:projectRoot 'Update-CodexUsagePet.ps1'
 $script:versionInfoPath = Join-Path $script:projectRoot 'version.json'
-$script:appVersion = '3.1.1'
+$script:appVersion = '3.1.2'
 try {
     if (Test-Path -LiteralPath $script:versionInfoPath) {
         $versionInfo = Get-Content -Raw -Encoding UTF8 -LiteralPath $script:versionInfoPath | ConvertFrom-Json
@@ -739,7 +739,20 @@ function Get-CodexMetrics {
     $todayKey = ([DateTime]::Today).ToString('yyyy-MM-dd')
     $today = if ($script:dailyHistory.ContainsKey($todayKey)) { Copy-UsageBucket $script:dailyHistory[$todayKey] } else { New-UsageBucket }
 
-    $latestRateState = $states | Where-Object { $null -ne $_.RateLimit } | Sort-Object RateLimitAt -Descending | Select-Object -First 1
+    $nowUnix = $now.ToUnixTimeSeconds()
+    $validRateStates = @($states | Where-Object {
+        $null -ne $_.RateLimit -and
+        [int64]$_.RateLimit.window_minutes -gt 0 -and
+        [int64]$_.RateLimit.resets_at -gt $nowUnix -and
+        [double]$_.RateLimit.used_percent -ge 0 -and
+        [double]$_.RateLimit.used_percent -le 100
+    })
+    # Model-specific pools (for example Codex Spark) can be written between general
+    # Codex records. Prefer the general pool so the main card does not jump between
+    # unrelated quota windows merely because another project wrote the newest event.
+    $generalRateStates = @($validRateStates | Where-Object { [string]$_.RateLimit.limit_id -eq 'codex' })
+    $rateStateCandidates = if ($generalRateStates.Count -gt 0) { $generalRateStates } else { $validRateStates }
+    $latestRateState = $rateStateCandidates | Sort-Object RateLimitAt -Descending | Select-Object -First 1
     $rate = if ($null -ne $latestRateState) { $latestRateState.RateLimit } else { $null }
     $remainingPercent = if ($null -ne $rate) { [Math]::Max(0, [Math]::Min(100, 100.0 - [double]$rate.used_percent)) } else { $null }
 
@@ -1080,6 +1093,7 @@ $script:lifetimeDisplayProjects = @{}
 $script:projectLifetimeTotals = @{}
 $script:visibleProjectCount = 0
 $script:notifyOnCompletion = $true
+$script:completionBubbleDurationSeconds = 10
 $script:quotaAlertsEnabled = $true
 $script:healthStatusVisible = $true
 $script:projectSortMode = 'lifetime'
@@ -1117,6 +1131,7 @@ $script:completionBubbleTail = $null
 $script:completionBubbleTitle = $null
 $script:completionBubbleProject = $null
 $script:completionBubbleHint = $null
+$script:completionBubbleTimer = $null
 $script:codexProcessLastChecked = [DateTimeOffset]::MinValue
 $script:codexProcessRunning = $false
 $script:updateCheckTimer = $null
@@ -1144,6 +1159,8 @@ if (Test-Path -LiteralPath $settingsPath) {
         $script:alerted90 = [bool](Get-SettingValue $settings 'alerted90' $false)
         $script:alertResetAt = [int64](Get-SettingValue $settings 'alertResetAt' 0)
         $script:notifyOnCompletion = [bool](Get-SettingValue $settings 'notify_on_completion' $true)
+        $loadedBubbleDuration = [int](Get-SettingValue $settings 'completion_bubble_seconds' 10)
+        $script:completionBubbleDurationSeconds = if (@(0,5,10,30) -contains $loadedBubbleDuration) { $loadedBubbleDuration } else { 10 }
         $script:quotaAlertsEnabled = [bool](Get-SettingValue $settings 'quota_alerts_enabled' $true)
         $script:healthStatusVisible = [bool](Get-SettingValue $settings 'health_status_visible' $true)
         $script:projectSortMode = [string](Get-SettingValue $settings 'project_sort_mode' 'lifetime')
@@ -1197,6 +1214,7 @@ function Save-PetPosition {
             alerted90 = $script:alerted90
             alertResetAt = $script:alertResetAt
             notify_on_completion = $script:notifyOnCompletion
+            completion_bubble_seconds = $script:completionBubbleDurationSeconds
             quota_alerts_enabled = $script:quotaAlertsEnabled
             health_status_visible = $script:healthStatusVisible
             project_sort_mode = $script:projectSortMode
@@ -1376,6 +1394,35 @@ function Set-CompletionBubbleTailDirection {
     $script:completionBubbleTail.Points = $points
 }
 
+function Stop-CompletionBubbleTimer {
+    if ($null -ne $script:completionBubbleTimer) { $script:completionBubbleTimer.Stop() }
+}
+
+function Start-CompletionBubbleTimer {
+    Stop-CompletionBubbleTimer
+    if ($script:completionBubbleDurationSeconds -le 0 -or
+        $null -eq $script:currentCompletionBubble -or
+        $null -eq $script:completionBubbleWindow -or
+        -not $script:completionBubbleWindow.IsVisible) { return }
+
+    if ($null -eq $script:completionBubbleTimer) {
+        $script:completionBubbleTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:completionBubbleTimer.Add_Tick({
+            Stop-CompletionBubbleTimer
+            Dismiss-CompletionBubble $true
+        })
+    }
+    $script:completionBubbleTimer.Interval = [TimeSpan]::FromSeconds($script:completionBubbleDurationSeconds)
+    $script:completionBubbleTimer.Start()
+}
+
+function Suspend-CompletionBubble {
+    Stop-CompletionBubbleTimer
+    if ($null -ne $script:completionBubbleWindow -and $script:completionBubbleWindow.IsVisible) {
+        $script:completionBubbleWindow.Hide()
+    }
+}
+
 function Update-CompletionBubblePosition {
     if ($null -eq $script:completionBubbleWindow -or -not $script:completionBubbleWindow.IsVisible) { return }
     try {
@@ -1497,6 +1544,7 @@ function Show-NextCompletionBubble {
     }
     if (-not $window.IsVisible) { return }
 
+    $wasVisible = $null -ne $script:completionBubbleWindow -and $script:completionBubbleWindow.IsVisible
     Initialize-CompletionBubble
     $entry = $script:currentCompletionBubble
     $script:completionBubbleTitle.Text = '✓ 任务弄好了'
@@ -1507,13 +1555,12 @@ function Show-NextCompletionBubble {
     $script:completionBubbleWindow.Opacity = [double]$script:windowOpacityPercent / 100.0
     if (-not $script:completionBubbleWindow.IsVisible) { $script:completionBubbleWindow.Show() }
     Update-CompletionBubblePosition
+    if (-not $wasVisible) { Start-CompletionBubbleTimer }
 }
 
 function Dismiss-CompletionBubble {
     param([bool]$ShowNext = $true)
-    if ($null -ne $script:completionBubbleWindow -and $script:completionBubbleWindow.IsVisible) {
-        $script:completionBubbleWindow.Hide()
-    }
+    Suspend-CompletionBubble
     $script:currentCompletionBubble = $null
     if ($ShowNext) { Show-NextCompletionBubble }
 }
@@ -2135,6 +2182,8 @@ function Sync-SettingsControls {
     $script:opacitySlider.Value = $script:windowOpacityPercent
     $script:opacityValue.Text = "$($script:windowOpacityPercent)%"
     $script:completionCheck.IsChecked = $script:notifyOnCompletion
+    Select-ComboChoice $script:completionDurationCombo ([string]$script:completionBubbleDurationSeconds)
+    $script:completionDurationCombo.IsEnabled = $script:notifyOnCompletion
     $script:quotaCheck.IsChecked = $script:quotaAlertsEnabled
     $script:healthCheck.IsChecked = $script:healthStatusVisible
     $script:topmostCheck.IsChecked = $script:topmostEnabled
@@ -2152,6 +2201,7 @@ function Save-ControlCenterSettings {
         $script:animationSpeed = [string]$script:animationCombo.SelectedItem.Tag
         $script:windowOpacityPercent = [Math]::Max(40, [Math]::Min(100, [int][Math]::Round($script:opacitySlider.Value)))
         $script:notifyOnCompletion = [bool]$script:completionCheck.IsChecked
+        $script:completionBubbleDurationSeconds = [int]$script:completionDurationCombo.SelectedItem.Tag
         $script:quotaAlertsEnabled = [bool]$script:quotaCheck.IsChecked
         $script:healthStatusVisible = [bool]$script:healthCheck.IsChecked
         $script:topmostEnabled = [bool]$script:topmostCheck.IsChecked
@@ -2163,6 +2213,7 @@ function Save-ControlCenterSettings {
             $script:completionBubbleWindow.Topmost = $script:topmostEnabled
             $script:completionBubbleWindow.Opacity = [double]$script:windowOpacityPercent / 100.0
         }
+        Start-CompletionBubbleTimer
         $refreshTimer.Interval = [TimeSpan]::FromSeconds($script:refreshSeconds)
         Set-PetAutoStart ([bool]$script:autoStartCheck.IsChecked)
         Save-PetPosition
@@ -2358,6 +2409,7 @@ function Initialize-ControlCenter {
             <Grid Margin="0,8,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock Text="窗口透明度" Foreground="#CBD5E8" VerticalAlignment="Center"/><Grid Grid.Column="1"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="44"/></Grid.ColumnDefinitions><Slider x:Name="OpacitySlider" Minimum="40" Maximum="100" Value="100" TickFrequency="5" IsSnapToTickEnabled="True" VerticalAlignment="Center" ToolTip="调整主助手窗口透明度"/><TextBlock x:Name="OpacityValue" Grid.Column="1" Text="100%" Foreground="#93A4BD" HorizontalAlignment="Right" VerticalAlignment="Center"/></Grid></Grid>
             <TextBlock Text="通知与系统" Foreground="#79AFFF" FontWeight="SemiBold" FontSize="13" Margin="0,18,0,0"/>
             <CheckBox x:Name="CompletionCheck" Content="项目任务完成时通知" Foreground="#CBD5E8" Margin="0,10,0,0"/>
+            <Grid Margin="22,8,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="148"/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock Text="完成气泡停留时间" Foreground="#AEBBD0" VerticalAlignment="Center"/><ComboBox x:Name="CompletionDurationCombo" Grid.Column="1" Height="27"/></Grid>
             <CheckBox x:Name="QuotaCheck" Content="80% / 90% 额度通知" Foreground="#CBD5E8" Margin="0,8,0,0"/>
             <CheckBox x:Name="HealthCheck" Content="主窗口显示数据健康状态" Foreground="#CBD5E8" Margin="0,8,0,0"/>
             <CheckBox x:Name="TopmostCheck" Content="助手始终置顶" Foreground="#CBD5E8" Margin="0,8,0,0"/>
@@ -2372,7 +2424,7 @@ function Initialize-ControlCenter {
           <Grid Margin="0,12,0,0"><Grid.RowDefinitions><RowDefinition Height="34"/><RowDefinition Height="38"/><RowDefinition/></Grid.RowDefinitions><TextBlock x:Name="SelfCheckSummary" Foreground="#AAB6CC" FontSize="12"/><Button x:Name="RunSelfCheck" Grid.Row="1" Content="立即重新检查" Width="125" Height="28" HorizontalAlignment="Left" Background="#315D91" Foreground="White" BorderThickness="0" Cursor="Hand"/><ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="SelfCheckPanel"/></ScrollViewer></Grid>
         </TabItem>
       </TabControl>
-      <TextBlock Grid.Row="2" Text="项目行和排行榜均可单击跳转 Codex 任务" Foreground="#657188" FontSize="10" VerticalAlignment="Bottom"/>
+      <TextBlock Grid.Row="2" Text="项目行和排行榜均需双击跳转 Codex 任务" Foreground="#657188" FontSize="10" VerticalAlignment="Bottom"/>
     </Grid>
   </Border>
 </Window>
@@ -2392,6 +2444,7 @@ function Initialize-ControlCenter {
     $script:opacitySlider = $script:controlCenterWindow.FindName('OpacitySlider')
     $script:opacityValue = $script:controlCenterWindow.FindName('OpacityValue')
     $script:completionCheck = $script:controlCenterWindow.FindName('CompletionCheck')
+    $script:completionDurationCombo = $script:controlCenterWindow.FindName('CompletionDurationCombo')
     $script:quotaCheck = $script:controlCenterWindow.FindName('QuotaCheck')
     $script:healthCheck = $script:controlCenterWindow.FindName('HealthCheck')
     $script:topmostCheck = $script:controlCenterWindow.FindName('TopmostCheck')
@@ -2402,6 +2455,10 @@ function Initialize-ControlCenter {
     $script:selfCheckSummary = $script:controlCenterWindow.FindName('SelfCheckSummary')
     $script:selfCheckPanel = $script:controlCenterWindow.FindName('SelfCheckPanel')
     foreach ($seconds in @(2,5,10,30)) { Add-ComboChoice $script:refreshCombo "$seconds 秒" ([string]$seconds) }
+    Add-ComboChoice $script:completionDurationCombo '5 秒' '5'
+    Add-ComboChoice $script:completionDurationCombo '10 秒' '10'
+    Add-ComboChoice $script:completionDurationCombo '30 秒' '30'
+    Add-ComboChoice $script:completionDurationCombo '永久存在' '0'
     Add-ComboChoice $script:sortCombo '累计消耗从高到低' 'lifetime'
     Add-ComboChoice $script:sortCombo '最近活动优先' 'recent'
     Add-ComboChoice $script:animationCombo '安静' 'quiet'
@@ -2411,12 +2468,14 @@ function Initialize-ControlCenter {
         $opacityPreview = [Math]::Max(40, [Math]::Min(100, [int][Math]::Round($script:opacitySlider.Value)))
         $script:opacityValue.Text = "$opacityPreview%"
     })
+    $script:completionCheck.Add_Checked({ $script:completionDurationCombo.IsEnabled = $true })
+    $script:completionCheck.Add_Unchecked({ $script:completionDurationCombo.IsEnabled = $false })
     $controlHeader.Add_MouseLeftButtonDown({ try { $script:controlCenterWindow.DragMove() } catch {} })
     $close.Add_Click({ $script:controlCenterWindow.Hide() })
     $script:controlCenterWindow.Add_Closing({ param($sender,$eventArgs); if (-not $script:isExiting) { $eventArgs.Cancel = $true; $script:controlCenterWindow.Hide() } })
     $script:controlCenterWindow.FindName('SettingsSave').Add_Click({ Save-ControlCenterSettings })
     $script:controlCenterWindow.FindName('SettingsDefaults').Add_Click({
-        Select-ComboChoice $script:refreshCombo '2'; Select-ComboChoice $script:sortCombo 'lifetime'; Select-ComboChoice $script:animationCombo 'normal'; $script:opacitySlider.Value = 100
+        Select-ComboChoice $script:refreshCombo '2'; Select-ComboChoice $script:sortCombo 'lifetime'; Select-ComboChoice $script:animationCombo 'normal'; Select-ComboChoice $script:completionDurationCombo '10'; $script:opacitySlider.Value = 100
         $script:completionCheck.IsChecked = $true; $script:quotaCheck.IsChecked = $true; $script:healthCheck.IsChecked = $true; $script:topmostCheck.IsChecked = $true; $script:autoUpdateCheck.IsChecked = $true
         $script:settingsStatus.Text = '已填入推荐值，点击“保存并应用”生效'
     })
@@ -2593,19 +2652,19 @@ $window.Add_LocationChanged({ Update-CompletionBubblePosition })
 $window.Add_SizeChanged({ Update-CompletionBubblePosition })
 $window.Add_StateChanged({
     if ($window.WindowState -eq 'Minimized') {
-        if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+        Suspend-CompletionBubble
     } elseif ($window.IsVisible) {
         Show-NextCompletionBubble
     }
 })
 $hideButton.Add_Click({
     Save-PetPosition
-    if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+    Suspend-CompletionBubble
     $window.Hide()
 })
 $minimizeButton.Add_Click({
     Save-PetPosition
-    if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+    Suspend-CompletionBubble
     $window.WindowState = 'Minimized'
 })
 $historyButton.Add_Click({ Show-HistoryWindow })
@@ -2732,7 +2791,7 @@ $showAction = {
         Show-NextCompletionBubble
     } elseif ($window.IsVisible) {
         Save-PetPosition
-        if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+        Suspend-CompletionBubble
         $window.Hide()
     } else {
         $window.WindowState = 'Normal'
@@ -2766,7 +2825,7 @@ $window.Add_Closing({
     if (-not $script:isExiting) {
         $eventArgs.Cancel = $true
         Save-PetPosition
-        if ($null -ne $script:completionBubbleWindow) { $script:completionBubbleWindow.Hide() }
+        Suspend-CompletionBubble
         $window.Hide()
     }
 })
@@ -2851,6 +2910,7 @@ try {
     $wakeTimer.Stop()
     $petAnimationTimer.Stop()
     if ($null -ne $script:updateCheckTimer) { $script:updateCheckTimer.Stop() }
+    Stop-CompletionBubbleTimer
     if ($null -ne $script:historyWindow) {
         $script:isExiting = $true
         $script:historyWindow.Close()
