@@ -57,6 +57,13 @@ if ($FromInstaller) {
         $dataPath = Join-Path $projectRoot $dataName
         if (Test-Path -LiteralPath $dataPath -PathType Leaf) { Remove-Item -LiteralPath $dataPath -Force }
     }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $localAppDataRoot = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
+        $accountSyncRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'CodexUsagePet\account-sync'))
+        if ($accountSyncRoot.StartsWith($localAppDataRoot, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $accountSyncRoot -PathType Container)) {
+            Remove-Item -LiteralPath $accountSyncRoot -Recurse -Force
+        }
+    }
 } else {
     Write-Host '未检测到正式安装器；已停止程序并移除快捷方式，程序目录保持不变。'
 }
