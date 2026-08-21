@@ -1,6 +1,8 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$Once
+    [switch]$Once,
+    [switch]$AccountSnapshotWorker,
+    [string]$AccountSnapshotResultPath = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -138,6 +140,18 @@ $script:lastSamplePath = ''
 $script:lastSampleTotal = [int64]0
 $script:lastSampleAt = [DateTimeOffset]::Now
 $script:lastMetrics = $null
+$script:accountRateLimit = $null
+$script:accountRateLimitAt = [DateTimeOffset]::MinValue
+$script:accountRefreshLastAttempt = [DateTimeOffset]::MinValue
+$script:accountRefreshIntervalSeconds = 60
+$script:accountRefreshLastSucceeded = $false
+$script:accountRefreshLastError = ''
+$script:accountHelperSourcePath = ''
+$script:accountRefreshProcess = $null
+$script:accountRefreshResultPath = ''
+$script:manualAccountRefreshPending = $false
+$script:statusOverrideText = ''
+$script:statusOverrideUntil = [DateTimeOffset]::MinValue
 
 function Process-CodexRecord {
     param($State, [string]$Line)
@@ -700,7 +714,254 @@ function Get-ProjectLifetimeRanking {
     return @($ranking | Sort-Object -Property @{ Expression = { [int64]$_.total_tokens }; Descending = $true })
 }
 
+function Find-CodexAccountExecutable {
+    $candidates = New-Object System.Collections.ArrayList
+    try {
+        foreach ($package in @(Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | Sort-Object Version -Descending)) {
+            $packageExecutable = Join-Path ([string]$package.InstallLocation) 'app\resources\codex.exe'
+            if (Test-Path -LiteralPath $packageExecutable) { [void]$candidates.Add($packageExecutable) }
+        }
+    } catch {}
+    try {
+        $windowsAppsRoot = Join-Path $env:ProgramFiles 'WindowsApps'
+        foreach ($packageRoot in @(Get-ChildItem -LiteralPath $windowsAppsRoot -Directory -Filter 'OpenAI.Codex_*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
+            $packageExecutable = Join-Path $packageRoot.FullName 'app\resources\codex.exe'
+            if (Test-Path -LiteralPath $packageExecutable) { [void]$candidates.Add($packageExecutable) }
+        }
+    } catch {}
+    try {
+        foreach ($command in @(Get-Command codex.exe -All -ErrorAction SilentlyContinue)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+                [void]$candidates.Add([string]$command.Source)
+            }
+        }
+    } catch {}
+    try {
+        foreach ($process in @(Get-Process -Name 'codex' -ErrorAction SilentlyContinue)) {
+            try {
+                if (-not [string]::IsNullOrWhiteSpace([string]$process.Path)) {
+                    [void]$candidates.Add([string]$process.Path)
+                }
+            } catch {}
+        }
+    } catch {}
+    foreach ($candidate in @($candidates)) {
+        if ((Test-Path -LiteralPath $candidate) -and [System.IO.Path]::GetExtension($candidate) -ieq '.exe') {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    throw '未找到 Codex 桌面版自带的账户同步组件，请确认 Codex 已安装。'
+}
+
+function Get-CodexAccountHelperPath {
+    $sourcePath = Find-CodexAccountExecutable
+    $script:accountHelperSourcePath = $sourcePath
+
+    # Microsoft Store apps can be read but cannot be launched directly by a normal
+    # PowerShell process. Keep a version-matched user-local copy for the account RPC.
+    if ($sourcePath -notlike '*\WindowsApps\*') { return $sourcePath }
+
+    $localRoot = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        Join-Path $env:TEMP 'CodexUsagePet'
+    } else {
+        Join-Path $env:LOCALAPPDATA 'CodexUsagePet'
+    }
+    $helperRoot = Join-Path $localRoot 'account-sync'
+    $helperPath = Join-Path $helperRoot 'codex-account-helper.exe'
+    $metadataPath = Join-Path $helperRoot 'helper-source.json'
+    $sourceInfo = Get-Item -LiteralPath $sourcePath -ErrorAction Stop
+    $fingerprint = '{0}|{1}|{2}' -f $sourceInfo.FullName, $sourceInfo.Length, $sourceInfo.LastWriteTimeUtc.Ticks
+    $cacheValid = $false
+
+    if ((Test-Path -LiteralPath $helperPath) -and (Test-Path -LiteralPath $metadataPath)) {
+        try {
+            $metadata = Get-Content -Raw -Encoding UTF8 -LiteralPath $metadataPath | ConvertFrom-Json
+            $helperInfo = Get-Item -LiteralPath $helperPath -ErrorAction Stop
+            $cacheValid = ([string]$metadata.fingerprint -eq $fingerprint -and [int64]$helperInfo.Length -eq [int64]$sourceInfo.Length)
+        } catch { $cacheValid = $false }
+    }
+    if ($cacheValid) { return $helperPath }
+
+    New-Item -ItemType Directory -Path $helperRoot -Force | Out-Null
+    $temporaryPath = Join-Path $helperRoot ('codex-account-helper-' + [guid]::NewGuid().ToString('N') + '.tmp.exe')
+    Copy-Item -LiteralPath $sourcePath -Destination $temporaryPath -Force
+    Move-Item -LiteralPath $temporaryPath -Destination $helperPath -Force
+    [pscustomobject]@{
+        fingerprint = $fingerprint
+        source = $sourceInfo.FullName
+        cached_at = [DateTimeOffset]::Now.ToString('o')
+    } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding UTF8
+    return $helperPath
+}
+
+function Invoke-CodexAccountRequest {
+    param([string]$Method)
+
+    $executablePath = Get-CodexAccountHelperPath
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $executablePath
+    $startInfo.Arguments = 'app-server --stdio'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    try {
+        $initializeRequest = @{
+            id = 1
+            method = 'initialize'
+            params = @{
+                clientInfo = @{ name = 'codex-usage-pet'; version = $script:appVersion }
+                capabilities = @{}
+            }
+        } | ConvertTo-Json -Compress -Depth 10
+        $accountRequest = @{ id = 2; method = $Method; params = $null } | ConvertTo-Json -Compress -Depth 10
+        $process.StandardInput.WriteLine($initializeRequest)
+        $process.StandardInput.WriteLine($accountRequest)
+        $process.StandardInput.Flush()
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            $remainingMilliseconds = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $readTask = $process.StandardOutput.ReadLineAsync()
+            if (-not $readTask.Wait($remainingMilliseconds)) { break }
+            $line = $readTask.Result
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $response = $line | ConvertFrom-Json } catch { continue }
+            if ($null -eq $response.PSObject.Properties['id'] -or [int]$response.id -ne 2) { continue }
+            if ($null -ne $response.PSObject.Properties['error'] -and $null -ne $response.error) {
+                $errorText = if ($null -ne $response.error.PSObject.Properties['message']) { [string]$response.error.message } else { [string]($response.error | ConvertTo-Json -Compress -Depth 5) }
+                throw ('Codex 账户接口返回错误：' + $errorText)
+            }
+            return $response.result
+        }
+        throw 'Codex 账户同步超时。'
+    } finally {
+        try { $process.StandardInput.Close() } catch {}
+        try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+        $process.Dispose()
+    }
+}
+
+function Update-CodexAccountSnapshot {
+    param([switch]$Force)
+
+    $now = [DateTimeOffset]::Now
+    if (-not $Force -and ($now - $script:accountRefreshLastAttempt).TotalSeconds -lt $script:accountRefreshIntervalSeconds) {
+        return [pscustomobject]@{ attempted = $false; succeeded = $script:accountRefreshLastSucceeded; message = $script:accountRefreshLastError }
+    }
+    $script:accountRefreshLastAttempt = $now
+    try {
+        $response = Invoke-CodexAccountRequest 'account/rateLimits/read'
+        $snapshot = $null
+        if ($null -ne $response.PSObject.Properties['rateLimitsByLimitId'] -and $null -ne $response.rateLimitsByLimitId) {
+            $codexProperty = $response.rateLimitsByLimitId.PSObject.Properties['codex']
+            if ($null -ne $codexProperty) { $snapshot = $codexProperty.Value }
+        }
+        if ($null -eq $snapshot -and $null -ne $response.PSObject.Properties['rateLimits']) {
+            $snapshot = $response.rateLimits
+        }
+        if ($null -eq $snapshot -or $null -eq $snapshot.primary) { throw '账户接口没有返回 Codex 主额度窗口。' }
+        $primary = $snapshot.primary
+        if ($null -eq $primary.resetsAt -or $null -eq $primary.windowDurationMins) { throw '账户额度窗口信息不完整。' }
+        $limitIdProperty = $snapshot.PSObject.Properties['limitId']
+        $planTypeProperty = $snapshot.PSObject.Properties['planType']
+        $script:accountRateLimit = [pscustomobject]@{
+            limit_id = if ($null -ne $limitIdProperty -and $null -ne $limitIdProperty.Value) { [string]$limitIdProperty.Value } else { 'codex' }
+            used_percent = [double]$primary.usedPercent
+            window_minutes = [int64]$primary.windowDurationMins
+            resets_at = [int64]$primary.resetsAt
+            plan_type = if ($null -ne $planTypeProperty -and $null -ne $planTypeProperty.Value) { [string]$planTypeProperty.Value } else { '' }
+        }
+        $script:accountRateLimitAt = [DateTimeOffset]::Now
+        $script:accountRefreshLastSucceeded = $true
+        $script:accountRefreshLastError = ''
+        return [pscustomobject]@{ attempted = $true; succeeded = $true; message = '账户额度已同步' }
+    } catch {
+        $script:accountRefreshLastSucceeded = $false
+        $script:accountRefreshLastError = $_.Exception.Message
+        return [pscustomobject]@{ attempted = $true; succeeded = $false; message = $_.Exception.Message }
+    }
+}
+
+function Start-CodexAccountRefresh {
+    param([switch]$Force)
+
+    $now = [DateTimeOffset]::Now
+    if ($null -ne $script:accountRefreshProcess) { return $false }
+    if (-not $Force -and ($now - $script:accountRefreshLastAttempt).TotalSeconds -lt $script:accountRefreshIntervalSeconds) { return $false }
+
+    $resultRoot = Join-Path $env:TEMP 'CodexUsagePet\account-results'
+    New-Item -ItemType Directory -Path $resultRoot -Force | Out-Null
+    $resultPath = Join-Path $resultRoot ('account-' + [guid]::NewGuid().ToString('N') + '.json')
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -AccountSnapshotWorker -AccountSnapshotResultPath "{1}"' -f $script:petScriptPath, $resultPath
+    try {
+        $script:accountRefreshLastAttempt = $now
+        $script:accountRefreshLastSucceeded = $false
+        $script:accountRefreshLastError = ''
+        $script:accountRefreshProcess = Start-Process -FilePath $powerShellExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        $script:accountRefreshResultPath = $resultPath
+        return $true
+    } catch {
+        $script:accountRefreshProcess = $null
+        $script:accountRefreshResultPath = ''
+        $script:accountRefreshLastSucceeded = $false
+        $script:accountRefreshLastError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Complete-CodexAccountRefresh {
+    if ($null -eq $script:accountRefreshProcess -or -not $script:accountRefreshProcess.HasExited) { return $false }
+
+    $resultPath = [string]$script:accountRefreshResultPath
+    try {
+        if (-not (Test-Path -LiteralPath $resultPath)) { throw '账户同步进程未返回结果。' }
+        $result = Get-Content -Raw -Encoding UTF8 -LiteralPath $resultPath | ConvertFrom-Json
+        if (-not [bool]$result.succeeded) { throw [string]$result.message }
+        $rate = $result.rate_limit
+        $script:accountRateLimit = [pscustomobject]@{
+            limit_id = [string]$rate.limit_id
+            used_percent = [double]$rate.used_percent
+            window_minutes = [int64]$rate.window_minutes
+            resets_at = [int64]$rate.resets_at
+            plan_type = [string]$rate.plan_type
+        }
+        $script:accountRateLimitAt = [DateTimeOffset]::Parse([string]$result.synced_at).ToLocalTime()
+        $script:accountRefreshLastSucceeded = $true
+        $script:accountRefreshLastError = ''
+        if ($script:manualAccountRefreshPending) {
+            $script:statusOverrideText = '已刷新 · 账户额度已同步 ' + (Get-Date -Format 'HH:mm:ss')
+            $script:statusOverrideUntil = [DateTimeOffset]::Now.AddSeconds(6)
+        }
+    } catch {
+        $script:accountRefreshLastSucceeded = $false
+        $script:accountRefreshLastError = $_.Exception.Message
+        if ($script:manualAccountRefreshPending) {
+            $script:statusOverrideText = '本机日志已刷新 · 账户同步失败'
+            $script:statusOverrideUntil = [DateTimeOffset]::Now.AddSeconds(6)
+        }
+    } finally {
+        try { $script:accountRefreshProcess.Dispose() } catch {}
+        $script:accountRefreshProcess = $null
+        $script:accountRefreshResultPath = ''
+        $script:manualAccountRefreshPending = $false
+        if (-not [string]::IsNullOrWhiteSpace($resultPath) -and (Test-Path -LiteralPath $resultPath)) {
+            try { Remove-Item -LiteralPath $resultPath -Force } catch {}
+        }
+    }
+    return $true
+}
+
 function Get-CodexMetrics {
+    param([switch]$ForceAccountSync)
+
+    [void](Complete-CodexAccountRefresh)
+    [void](Start-CodexAccountRefresh -Force:$ForceAccountSync)
     $now = [DateTimeOffset]::Now
     Update-CodexProjectMetadata
     if ($now.Date -ne $script:dayStart.Date) {
@@ -754,6 +1015,15 @@ function Get-CodexMetrics {
     $rateStateCandidates = if ($generalRateStates.Count -gt 0) { $generalRateStates } else { $validRateStates }
     $latestRateState = $rateStateCandidates | Sort-Object RateLimitAt -Descending | Select-Object -First 1
     $rate = if ($null -ne $latestRateState) { $latestRateState.RateLimit } else { $null }
+    $quotaSource = if ($null -ne $rate) { 'local_log' } else { 'unavailable' }
+    if ($null -ne $script:accountRateLimit -and
+        [int64]$script:accountRateLimit.window_minutes -gt 0 -and
+        [int64]$script:accountRateLimit.resets_at -gt $nowUnix -and
+        [double]$script:accountRateLimit.used_percent -ge 0 -and
+        [double]$script:accountRateLimit.used_percent -le 100) {
+        $rate = $script:accountRateLimit
+        $quotaSource = if ($script:accountRefreshLastSucceeded) { 'account_live' } else { 'account_cached' }
+    }
     $remainingPercent = if ($null -ne $rate) { [Math]::Max(0, [Math]::Min(100, 100.0 - [double]$rate.used_percent)) } else { $null }
 
     $taskUsage = if ($currentState.TaskActive) {
@@ -848,6 +1118,9 @@ function Get-CodexMetrics {
         resets_at = if ($null -ne $rate) { [int64]$rate.resets_at } else { $null }
         reset_label = if ($null -ne $rate) { Get-ResetLabel ([int64]$rate.resets_at) } else { '额度信息等待 Codex 更新' }
         plan_type = if ($null -ne $rate) { $rate.plan_type } else { '' }
+        quota_source = $quotaSource
+        account_synced_at = if ($script:accountRateLimitAt -ne [DateTimeOffset]::MinValue) { $script:accountRateLimitAt.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+        account_sync_error = [string]$script:accountRefreshLastError
         projects = @($projects)
         lifetime_ranking = @($projectLifetimeRanking)
         daily_history = @(Get-DailyHistoryArray 42)
@@ -861,9 +1134,27 @@ function Get-CodexMetrics {
     }
 }
 
+if ($AccountSnapshotWorker) {
+    if ([string]::IsNullOrWhiteSpace($AccountSnapshotResultPath)) { throw '账户同步结果路径不能为空。' }
+    $workerResult = Update-CodexAccountSnapshot -Force
+    $payload = [pscustomobject]@{
+        succeeded = [bool]$workerResult.succeeded
+        message = [string]$workerResult.message
+        synced_at = if ($script:accountRateLimitAt -ne [DateTimeOffset]::MinValue) { $script:accountRateLimitAt.ToString('o') } else { [DateTimeOffset]::Now.ToString('o') }
+        rate_limit = $script:accountRateLimit
+    } | ConvertTo-Json -Depth 8
+    $resultDirectory = Split-Path -Parent $AccountSnapshotResultPath
+    New-Item -ItemType Directory -Path $resultDirectory -Force | Out-Null
+    $temporaryResultPath = $AccountSnapshotResultPath + '.tmp'
+    Set-Content -LiteralPath $temporaryResultPath -Value $payload -Encoding UTF8
+    Move-Item -LiteralPath $temporaryResultPath -Destination $AccountSnapshotResultPath -Force
+    exit $(if ($workerResult.succeeded) { 0 } else { 1 })
+}
+
 Load-HistoryCache
 
 if ($Once) {
+    [void](Update-CodexAccountSnapshot -Force)
     Get-CodexMetrics | ConvertTo-Json -Depth 8
     exit 0
 }
@@ -933,7 +1224,8 @@ Add-Type -AssemblyName System.Drawing
                     <ColumnDefinition x:Name="PetColumn" Width="46"/>
                     <ColumnDefinition x:Name="TitleColumn" Width="*"/>
                     <ColumnDefinition x:Name="HistoryColumn" Width="20"/>
-                    <ColumnDefinition x:Name="RestoreColumn" Width="20"/>
+                    <ColumnDefinition x:Name="RefreshColumn" Width="20"/>
+                    <ColumnDefinition x:Name="ShowAllColumn" Width="20"/>
                     <ColumnDefinition x:Name="SettingsColumn" Width="20"/>
                     <ColumnDefinition x:Name="MinimizeColumn" Width="20"/>
                     <ColumnDefinition x:Name="HideColumn" Width="20"/>
@@ -949,10 +1241,11 @@ Add-Type -AssemblyName System.Drawing
                     <TextBlock x:Name="StatusText" Text="正在读取用量…" Foreground="#AAB6CC" FontSize="9" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
                 <Button x:Name="HistoryButton" Grid.Column="2" Content="▥" Width="19" Height="19" VerticalAlignment="Top" Foreground="#7DB4FF" Background="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand" ToolTip="用量历史"/>
-                <Button x:Name="RestoreProjectsButton" Grid.Column="3" Content="↺" Width="19" Height="19" VerticalAlignment="Top" Foreground="#A58BFA" Background="Transparent" BorderThickness="0" FontSize="12" Cursor="Hand" ToolTip="显示所有隐藏项目"/>
-                <Button x:Name="SettingsButton" Grid.Column="4" Content="⚙" Width="19" Height="19" VerticalAlignment="Top" Foreground="#7FD7C4" Background="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand" ToolTip="控制中心"/>
-                <Button x:Name="MinimizeButton" Grid.Column="5" Content="—" Width="19" Height="19" VerticalAlignment="Top" Foreground="#AAB6CC" Background="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand" ToolTip="最小化"/>
-                <Button x:Name="HideButton" Grid.Column="6" Content="×" Width="19" Height="19" VerticalAlignment="Top" Foreground="#AAB6CC" Background="Transparent" BorderThickness="0" FontSize="14" Cursor="Hand" ToolTip="隐藏到托盘"/>
+                <Button x:Name="RefreshButton" Grid.Column="3" Content="↺" Width="19" Height="19" VerticalAlignment="Top" Foreground="#A58BFA" Background="Transparent" BorderThickness="0" FontSize="12" Cursor="Hand" ToolTip="立即刷新账户额度和本机日志"/>
+                <Button x:Name="ShowAllProjectsButton" Grid.Column="4" Content="☰" Width="19" Height="19" VerticalAlignment="Top" Foreground="#7DB4FF" Background="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand" ToolTip="恢复隐藏项目" Opacity="0.45" IsEnabled="False"/>
+                <Button x:Name="SettingsButton" Grid.Column="5" Content="⚙" Width="19" Height="19" VerticalAlignment="Top" Foreground="#7FD7C4" Background="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand" ToolTip="控制中心"/>
+                <Button x:Name="MinimizeButton" Grid.Column="6" Content="—" Width="19" Height="19" VerticalAlignment="Top" Foreground="#AAB6CC" Background="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand" ToolTip="最小化"/>
+                <Button x:Name="HideButton" Grid.Column="7" Content="×" Width="19" Height="19" VerticalAlignment="Top" Foreground="#AAB6CC" Background="Transparent" BorderThickness="0" FontSize="14" Cursor="Hand" ToolTip="隐藏到托盘"/>
             </Grid>
 
             <Border x:Name="QuotaPanel" Grid.Row="1" Background="#161B27" CornerRadius="12" Padding="9,7">
@@ -1022,7 +1315,8 @@ $headerRow = $window.FindName('HeaderRow')
 $petColumn = $window.FindName('PetColumn')
 $titleColumn = $window.FindName('TitleColumn')
 $historyColumn = $window.FindName('HistoryColumn')
-$restoreColumn = $window.FindName('RestoreColumn')
+$refreshColumn = $window.FindName('RefreshColumn')
+$showAllColumn = $window.FindName('ShowAllColumn')
 $settingsColumn = $window.FindName('SettingsColumn')
 $minimizeColumn = $window.FindName('MinimizeColumn')
 $hideColumn = $window.FindName('HideColumn')
@@ -1042,7 +1336,8 @@ $petSprite = $window.FindName('PetSprite')
 $petBounce = $window.FindName('PetBounce')
 $statusText = $window.FindName('StatusText')
 $historyButton = $window.FindName('HistoryButton')
-$restoreProjectsButton = $window.FindName('RestoreProjectsButton')
+$refreshButton = $window.FindName('RefreshButton')
+$showAllProjectsButton = $window.FindName('ShowAllProjectsButton')
 $detailToggleButton = $window.FindName('DetailToggleButton')
 $settingsButton = $window.FindName('SettingsButton')
 $minimizeButton = $window.FindName('MinimizeButton')
@@ -1289,7 +1584,8 @@ function Set-PetOnlyMode {
 
         $titlePanel.Visibility = 'Collapsed'
         $historyButton.Visibility = 'Collapsed'
-        $restoreProjectsButton.Visibility = 'Collapsed'
+        $refreshButton.Visibility = 'Collapsed'
+        $showAllProjectsButton.Visibility = 'Collapsed'
         $settingsButton.Visibility = 'Collapsed'
         $minimizeButton.Visibility = 'Collapsed'
         $hideButton.Visibility = 'Collapsed'
@@ -1308,7 +1604,7 @@ function Set-PetOnlyMode {
         $rootCard.Padding = [System.Windows.Thickness]::new(5)
         $rootCard.Effect = $null
         $petColumn.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        foreach ($column in @($titleColumn,$historyColumn,$restoreColumn,$settingsColumn,$minimizeColumn,$hideColumn)) {
+        foreach ($column in @($titleColumn,$historyColumn,$refreshColumn,$showAllColumn,$settingsColumn,$minimizeColumn,$hideColumn)) {
             $column.Width = [System.Windows.GridLength]::new(0)
         }
         [System.Windows.Controls.Grid]::SetColumnSpan($petFrame, 1)
@@ -1332,7 +1628,7 @@ function Set-PetOnlyMode {
         $petFrame.Height = 44
         $petColumn.Width = [System.Windows.GridLength]::new(46)
         $titleColumn.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        foreach ($column in @($historyColumn,$restoreColumn,$settingsColumn,$minimizeColumn,$hideColumn)) {
+        foreach ($column in @($historyColumn,$refreshColumn,$showAllColumn,$settingsColumn,$minimizeColumn,$hideColumn)) {
             $column.Width = [System.Windows.GridLength]::new(20)
         }
         [System.Windows.Controls.Grid]::SetColumnSpan($petFrame, 1)
@@ -1345,7 +1641,8 @@ function Set-PetOnlyMode {
         }
         $titlePanel.Visibility = 'Visible'
         $historyButton.Visibility = 'Visible'
-        $restoreProjectsButton.Visibility = 'Visible'
+        $refreshButton.Visibility = 'Visible'
+        $showAllProjectsButton.Visibility = 'Visible'
         $settingsButton.Visibility = 'Visible'
         $minimizeButton.Visibility = 'Visible'
         $hideButton.Visibility = 'Visible'
@@ -1719,7 +2016,16 @@ function Update-DataHealthStatus {
     } else {
         $healthText.Text = '● 数据正常'
         $healthText.Foreground = Get-PetBrush '#4FD19A'
-        $healthText.ToolTip = "最后更新 $($Metrics.updated_at)`n会话文件 $($Metrics.source_file_count) 个`n项目映射 $($Metrics.project_metadata_count) 个"
+        $quotaHealth = if ([string]$Metrics.quota_source -eq 'account_live') {
+            "账户额度已同步 $($Metrics.account_synced_at)"
+        } elseif ([string]$Metrics.quota_source -eq 'account_cached') {
+            "账户额度同步中或暂时失败，显示 $($Metrics.account_synced_at) 的快照"
+        } elseif (-not [string]::IsNullOrWhiteSpace([string]$Metrics.account_sync_error)) {
+            '账户额度同步失败：' + [string]$Metrics.account_sync_error
+        } else {
+            '账户额度等待同步'
+        }
+        $healthText.ToolTip = "最后更新 $($Metrics.updated_at)`n$quotaHealth`n会话文件 $($Metrics.source_file_count) 个`n项目映射 $($Metrics.project_metadata_count) 个"
     }
 }
 
@@ -1976,8 +2282,9 @@ function Render-ProjectRows {
         [void]$projectsPanel.Children.Add((New-ProjectStatusRow $project))
     }
     $script:visibleProjectCount = $visibleProjects.Count
-    $restoreProjectsButton.ToolTip = "显示所有隐藏项目（$($script:hiddenProjects.Count)）"
-    $restoreProjectsButton.Opacity = if ($script:hiddenProjects.Count -gt 0) { 1.0 } else { 0.45 }
+    $showAllProjectsButton.ToolTip = "恢复隐藏项目（$($script:hiddenProjects.Count)）"
+    $showAllProjectsButton.IsEnabled = $script:hiddenProjects.Count -gt 0
+    $showAllProjectsButton.Opacity = if ($script:hiddenProjects.Count -gt 0) { 1.0 } else { 0.45 }
 
     if ($visibleProjects.Count -eq 0) {
         $statusText.Text = '项目已隐藏 · 新对话会自动出现'
@@ -2362,6 +2669,15 @@ function Invoke-PetSelfCheck {
     $updateConnection = Get-PetUpdateConnectionStatus
     Add-CheckResult '自动更新连接' $updateConnection.status $updateConnection.detail
     Add-CheckResult 'Codex 桌面进程' $(if (Test-CodexDesktopRunning) { 'PASS' } else { 'WARN' }) $(if ($script:codexProcessRunning) { '正在运行' } else { '当前未运行' })
+    if ($null -ne $script:accountRefreshProcess) {
+        Add-CheckResult '跨设备额度同步' 'WARN' '正在读取账户额度'
+    } elseif ($script:accountRefreshLastSucceeded) {
+        Add-CheckResult '跨设备额度同步' 'PASS' ("已同步于 {0}" -f $script:accountRateLimitAt.ToString('MM-dd HH:mm:ss'))
+    } elseif (-not [string]::IsNullOrWhiteSpace($script:accountRefreshLastError)) {
+        Add-CheckResult '跨设备额度同步' 'WARN' $script:accountRefreshLastError
+    } else {
+        Add-CheckResult '跨设备额度同步' 'WARN' '等待首次账户同步'
+    }
     try {
         if (Test-Path -LiteralPath $script:projectLifetimeCachePath) {
             $cache = Get-Content -Raw -Encoding UTF8 -LiteralPath $script:projectLifetimeCachePath | ConvertFrom-Json
@@ -2532,7 +2848,9 @@ function Check-UsageAlerts {
 }
 
 function Update-PetUi {
-    $metrics = Get-CodexMetrics
+    param([switch]$ForceAccountSync)
+
+    $metrics = Get-CodexMetrics -ForceAccountSync:$ForceAccountSync
     $script:lastMetrics = $metrics
     if (-not $metrics.available) {
         $statusText.Text = $metrics.message
@@ -2552,7 +2870,13 @@ function Update-PetUi {
     if ($null -ne $metrics.remaining_percent) {
         $remaining = [double]$metrics.remaining_percent
         $remainingText.Text = ('{0:0.##}%' -f $remaining)
-        $remainingText.ToolTip = '按 Codex 本地日志提供的原始精度显示；日志返回整数时不会补零伪装成小数精度。'
+        $remainingText.ToolTip = if ([string]$metrics.quota_source -eq 'account_live') {
+            "来自 Codex 账户实时额度（包含其他电脑）`n同步时间：$($metrics.account_synced_at)`n账户接口按整数百分比返回，不补零伪装精度。"
+        } elseif ([string]$metrics.quota_source -eq 'account_cached') {
+            "显示最近一次 Codex 账户额度快照（包含其他电脑）`n快照时间：$($metrics.account_synced_at)`n当前正在同步或最近一次同步失败。"
+        } else {
+            '账户同步暂不可用，当前采用本机日志额度；日志返回整数时不会补零伪装成小数精度。'
+        }
         $limitTitle.Text = '额度剩余 · ' + (Get-WindowLabel $metrics.window_minutes)
         $resetText.Text = $metrics.reset_label
         $availableWidth = [Math]::Max(0, $progressHost.ActualWidth)
@@ -2578,8 +2902,37 @@ function Update-PetUi {
     }
     Update-DataHealthStatus $metrics
     Check-UsageAlerts $metrics
+    if ([DateTimeOffset]::Now -lt $script:statusOverrideUntil -and -not [string]::IsNullOrWhiteSpace($script:statusOverrideText)) {
+        $statusText.Text = $script:statusOverrideText
+    }
     if ($null -ne $script:historyWindow -and $script:historyWindow.IsVisible) { Render-HistoryWindow }
     if ($null -ne $script:controlCenterWindow -and $script:controlCenterWindow.IsVisible) { Render-ControlCenter }
+}
+
+function Invoke-ManualPetRefresh {
+    $refreshButton.IsEnabled = $false
+    if ($null -ne $refreshItem) {
+        $refreshItem.Enabled = $false
+        $refreshItem.Text = '正在同步账户额度…'
+    }
+    try {
+        $script:manualAccountRefreshPending = $true
+        Update-PetUi -ForceAccountSync
+        $script:statusOverrideText = '本机日志已刷新 · 正在同步账户额度…'
+        $script:statusOverrideUntil = [DateTimeOffset]::Now.AddSeconds(6)
+        $statusText.Text = $script:statusOverrideText
+    } catch {
+        $script:manualAccountRefreshPending = $false
+        $script:statusOverrideText = '刷新失败 · 将自动重试'
+        $script:statusOverrideUntil = [DateTimeOffset]::Now.AddSeconds(6)
+        $statusText.Text = $script:statusOverrideText
+    } finally {
+        $refreshButton.IsEnabled = $true
+        if ($null -ne $refreshItem) {
+            $refreshItem.Text = '立即刷新（账户 + 本机）'
+            $refreshItem.Enabled = $true
+        }
+    }
 }
 
 $petStage.Add_MouseLeftButtonDown({
@@ -2668,7 +3021,8 @@ $minimizeButton.Add_Click({
     $window.WindowState = 'Minimized'
 })
 $historyButton.Add_Click({ Show-HistoryWindow })
-$restoreProjectsButton.Add_Click({ Restore-AllProjectRows })
+$refreshButton.Add_Click({ Invoke-ManualPetRefresh })
+$showAllProjectsButton.Add_Click({ Restore-AllProjectRows })
 $detailToggleButton.Add_Click({ Toggle-PetCompact })
 $settingsButton.Add_Click({ Show-ControlCenter 1 })
 $projectsScrollViewer.Add_PreviewMouseWheel({
@@ -2773,13 +3127,13 @@ $historyItem = $trayMenu.Items.Add('用量历史')
 $rankingItem = $trayMenu.Items.Add('项目用量排行')
 $settingsItem = $trayMenu.Items.Add('设置')
 $selfCheckItem = $trayMenu.Items.Add('版本与自检')
-$showAllProjectsItem = $trayMenu.Items.Add('显示所有项目')
-$refreshItem = $trayMenu.Items.Add('立即刷新')
+$showAllProjectsItem = $trayMenu.Items.Add('恢复隐藏项目')
+$refreshItem = $trayMenu.Items.Add('立即刷新（账户 + 本机）')
 $trayMenu.Items.Add('-') | Out-Null
 $exitItem = $trayMenu.Items.Add('退出')
 $notifyIcon.ContextMenuStrip = $trayMenu
 $trayMenu.Add_Opening({
-    $showAllProjectsItem.Text = "显示所有隐藏项目（$($script:hiddenProjects.Count)）"
+    $showAllProjectsItem.Text = "恢复隐藏项目（$($script:hiddenProjects.Count)）"
     $showAllProjectsItem.Enabled = $script:hiddenProjects.Count -gt 0
 })
 
@@ -2807,7 +3161,7 @@ $rankingItem.Add_Click({ Show-ControlCenter 0 })
 $settingsItem.Add_Click({ Show-ControlCenter 1 })
 $selfCheckItem.Add_Click({ Show-ControlCenter 2 })
 $showAllProjectsItem.Add_Click({ Restore-AllProjectRows })
-$refreshItem.Add_Click({ Update-PetUi })
+$refreshItem.Add_Click({ Invoke-ManualPetRefresh })
 $exitItem.Add_Click({
     $script:isExiting = $true
     Save-PetPosition
