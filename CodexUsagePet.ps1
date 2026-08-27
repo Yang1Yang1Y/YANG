@@ -94,7 +94,7 @@ $script:petScriptPath = $MyInvocation.MyCommand.Path
 $script:launcherScriptPath = Join-Path $script:projectRoot 'Start-CodexUsagePet.ps1'
 $script:releaseUpdaterPath = Join-Path $script:projectRoot 'Update-CodexUsagePet.ps1'
 $script:versionInfoPath = Join-Path $script:projectRoot 'version.json'
-$script:appVersion = '3.1.2'
+$script:appVersion = '3.2.0'
 try {
     if (Test-Path -LiteralPath $script:versionInfoPath) {
         $versionInfo = Get-Content -Raw -Encoding UTF8 -LiteralPath $script:versionInfoPath | ConvertFrom-Json
@@ -131,6 +131,10 @@ $script:projectLifetimeEntries = @{}
 $script:codexProjectNames = @{}
 $script:codexProjectPaths = @{}
 $script:threadProjectIds = @{}
+$script:threadDescriptions = @{}
+$script:codexUnreadThreadIds = @{}
+$script:codexUnreadStateAvailable = $false
+$script:unreadCompletedProjects = @{}
 $script:projectMetadataLastWriteTicks = [int64]0
 $script:sessionStates = @{}
 $script:dailyHistory = @{}
@@ -438,6 +442,9 @@ function Update-CodexProjectMetadata {
         $projectNames = @{}
         $projectPaths = @{}
         $assignments = @{}
+        $threadDescriptions = @{}
+        $unreadThreadIds = @{}
+        $unreadStateAvailable = $false
 
         $localProjectsProperty = $globalState.PSObject.Properties['local-projects']
         if ($null -ne $localProjectsProperty -and $null -ne $localProjectsProperty.Value) {
@@ -465,9 +472,43 @@ function Update-CodexProjectMetadata {
             }
         }
 
+        $persistedProperty = $globalState.PSObject.Properties['electron-persisted-atom-state']
+        if ($null -ne $persistedProperty -and $null -ne $persistedProperty.Value) {
+            $descriptionsProperty = $persistedProperty.Value.PSObject.Properties['thread-descriptions-v1']
+            if ($null -ne $descriptionsProperty -and $null -ne $descriptionsProperty.Value) {
+                foreach ($descriptionProperty in @($descriptionsProperty.Value.PSObject.Properties)) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$descriptionProperty.Value)) {
+                        $threadDescriptions[[string]$descriptionProperty.Name] = [string]$descriptionProperty.Value
+                    }
+                }
+            }
+            $unreadProperty = $persistedProperty.Value.PSObject.Properties['unread-thread-ids-by-host-v1']
+            if ($null -ne $unreadProperty -and $null -ne $unreadProperty.Value) {
+                $unreadStateAvailable = $true
+                foreach ($hostProperty in @($unreadProperty.Value.PSObject.Properties)) {
+                    foreach ($threadId in @($hostProperty.Value)) {
+                        if (-not [string]::IsNullOrWhiteSpace([string]$threadId)) { $unreadThreadIds[[string]$threadId] = $true }
+                    }
+                }
+            }
+        }
+
         $script:codexProjectNames = $projectNames
         $script:codexProjectPaths = $projectPaths
         $script:threadProjectIds = $assignments
+        $script:threadDescriptions = $threadDescriptions
+        $script:codexUnreadThreadIds = $unreadThreadIds
+        $script:codexUnreadStateAvailable = $unreadStateAvailable
+        if ($unreadStateAvailable) {
+            $staleUnreadProjectKeys = @()
+            foreach ($entry in @($script:unreadCompletedProjects.GetEnumerator())) {
+                $sessionId = [string]$entry.Value.session_id
+                if (-not [string]::IsNullOrWhiteSpace($sessionId) -and -not $unreadThreadIds.ContainsKey($sessionId)) {
+                    $staleUnreadProjectKeys += [string]$entry.Key
+                }
+            }
+            foreach ($projectKey in $staleUnreadProjectKeys) { [void]$script:unreadCompletedProjects.Remove($projectKey) }
+        }
         $script:projectMetadataLastWriteTicks = $writeTicks
     } catch {
         # Codex 更新状态文件时可能短暂被占用，保留旧映射并在下次刷新重试。
@@ -1408,6 +1449,7 @@ $script:baseWindowHeight = [double]272
 $script:userResized = $false
 $script:savedWindowWidth = [double]240
 $script:savedWindowHeight = [double]272
+$script:layoutProjectCount = [int]-1
 $script:isUserSizing = $false
 $script:isPetDragPending = $false
 $script:petDragMoved = $false
@@ -1469,6 +1511,7 @@ if (Test-Path -LiteralPath $settingsPath) {
         $script:userResized = [bool](Get-SettingValue $settings 'user_resized' $false)
         $script:savedWindowWidth = [Math]::Max(220, [Math]::Min(900, [double](Get-SettingValue $settings 'window_width' 240)))
         $script:savedWindowHeight = [Math]::Max(178, [Math]::Min(1200, [double](Get-SettingValue $settings 'window_height' 272)))
+        $script:layoutProjectCount = [int](Get-SettingValue $settings 'layout_project_count' -1)
         if ($script:userResized) {
             $window.Width = $script:savedWindowWidth
             $window.Height = $script:savedWindowHeight
@@ -1480,6 +1523,16 @@ if (Test-Path -LiteralPath $settingsPath) {
                 $script:hiddenProjects[$hiddenKey] = [pscustomobject]@{
                     session_path = [string](Get-SettingValue $hidden 'session_path' '')
                     task_started_ticks = [int64](Get-SettingValue $hidden 'task_started_ticks' 0)
+                }
+            }
+        }
+        foreach ($unread in @((Get-SettingValue $settings 'unread_completed_projects' @()))) {
+            $unreadKey = [string](Get-SettingValue $unread 'project_key' '')
+            if (-not [string]::IsNullOrWhiteSpace($unreadKey)) {
+                $script:unreadCompletedProjects[$unreadKey] = [pscustomobject]@{
+                    session_id = [string](Get-SettingValue $unread 'session_id' '')
+                    session_path = [string](Get-SettingValue $unread 'session_path' '')
+                    completed_ticks = [int64](Get-SettingValue $unread 'completed_ticks' 0)
                 }
             }
         }
@@ -1500,6 +1553,14 @@ function Save-PetPosition {
                 project_key = [string]$_.Key
                 session_path = [string]$_.Value.session_path
                 task_started_ticks = [int64]$_.Value.task_started_ticks
+            }
+        })
+        $unreadCompletedSettings = @($script:unreadCompletedProjects.GetEnumerator() | ForEach-Object {
+            [pscustomobject]@{
+                project_key = [string]$_.Key
+                session_id = [string]$_.Value.session_id
+                session_path = [string]$_.Value.session_path
+                completed_ticks = [int64]$_.Value.completed_ticks
             }
         })
         @{
@@ -1523,7 +1584,9 @@ function Save-PetPosition {
             user_resized = $script:userResized
             window_width = $widthToSave
             window_height = $heightToSave
+            layout_project_count = $script:layoutProjectCount
             hidden_projects = $hiddenProjectSettings
+            unread_completed_projects = $unreadCompletedSettings
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $settingsPath -Encoding UTF8
     } catch {}
 }
@@ -1661,15 +1724,71 @@ function Open-CodexThread {
     param([string]$SessionId, [string]$ProjectName)
     if ([string]::IsNullOrWhiteSpace($SessionId)) {
         $statusText.Text = '该项目暂无可跳转的 Codex 任务'
-        return
+        return $false
     }
     try {
         Start-Process ('codex://threads/' + $SessionId)
         $statusText.Text = '已打开：' + $ProjectName
+        return $true
     } catch {
         try { Start-Process 'codex://' } catch {}
         $statusText.Text = '无法直接跳转，已尝试唤醒 Codex'
+        return $false
     }
+}
+
+function Test-ProjectCompletionUnread {
+    param($Project)
+    if ($null -eq $Project -or [bool]$Project.active) { return $false }
+    $sessionId = [string]$Project.session_id
+    if (-not [string]::IsNullOrWhiteSpace($sessionId) -and $script:codexUnreadThreadIds.ContainsKey($sessionId)) { return $true }
+    $key = [string]$Project.project_key
+    if (-not $script:unreadCompletedProjects.ContainsKey($key)) { return $false }
+    $entry = $script:unreadCompletedProjects[$key]
+    $entrySessionId = [string]$entry.session_id
+    $entrySessionPath = [string]$entry.session_path
+    if (-not [string]::IsNullOrWhiteSpace($entrySessionId) -and
+        -not [string]::IsNullOrWhiteSpace([string]$Project.session_id)) {
+        return $entrySessionId -eq [string]$Project.session_id
+    }
+    return $entrySessionPath -eq [string]$Project.session_path
+}
+
+function Set-ProjectCompletionUnread {
+    param($Project)
+    if ($null -eq $Project) { return }
+    $key = [string]$Project.project_key
+    if ([string]::IsNullOrWhiteSpace($key)) { return }
+    $script:unreadCompletedProjects[$key] = [pscustomobject]@{
+        session_id = [string]$Project.session_id
+        session_path = [string]$Project.session_path
+        completed_ticks = [DateTimeOffset]::Now.UtcDateTime.Ticks
+    }
+    Save-PetPosition
+}
+
+function Clear-ProjectCompletionUnread {
+    param([string]$ProjectKey)
+    if ([string]::IsNullOrWhiteSpace($ProjectKey)) { return }
+    if ($null -ne $script:lastMetrics -and $script:lastMetrics.available) {
+        $project = @($script:lastMetrics.projects | Where-Object { [string]$_.project_key -eq $ProjectKey } | Select-Object -First 1)
+        if ($project.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$project[0].session_id)) {
+            [void]$script:codexUnreadThreadIds.Remove([string]$project[0].session_id)
+        }
+    }
+    if ($script:unreadCompletedProjects.ContainsKey($ProjectKey)) {
+        [void]$script:unreadCompletedProjects.Remove($ProjectKey)
+        Save-PetPosition
+    }
+    if ($null -ne $script:lastMetrics) { Render-ProjectRows $script:lastMetrics }
+}
+
+function Open-CodexProject {
+    param($Project)
+    if ($null -eq $Project) { return $false }
+    $opened = Open-CodexThread ([string]$Project.session_id) ([string]$Project.project_name)
+    if ($opened) { Clear-ProjectCompletionUnread ([string]$Project.project_key) }
+    return $opened
 }
 
 function Set-CompletionBubbleTailDirection {
@@ -1769,7 +1888,7 @@ function Initialize-CompletionBubble {
         Title="Codex 完成提示" Width="260" Height="94"
         WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True"
         Background="Transparent" ShowInTaskbar="False" ShowActivated="False"
-        Topmost="True" WindowStartupLocation="Manual">
+        Topmost="False" WindowStartupLocation="Manual">
   <Grid Background="Transparent">
     <Polygon x:Name="BubbleTail" Points="245,35 245,59 259,47" Fill="#FFFFFFFF"
              Stroke="#CBD5E1" StrokeThickness="1.2" StrokeLineJoin="Round" />
@@ -1820,7 +1939,8 @@ function Initialize-CompletionBubble {
         if ($null -eq $script:currentCompletionBubble) { return }
         $entry = $script:currentCompletionBubble
         Dismiss-CompletionBubble $false
-        Open-CodexThread ([string]$entry.session_id) ([string]$entry.project_name)
+        $opened = Open-CodexThread ([string]$entry.session_id) ([string]$entry.project_name)
+        if ($opened) { Clear-ProjectCompletionUnread ([string]$entry.project_key) }
         Show-NextCompletionBubble
         $eventArgs.Handled = $true
     })
@@ -1848,7 +1968,7 @@ function Show-NextCompletionBubble {
     $script:completionBubbleProject.Text = [string]$entry.project_name
     $remaining = $script:completionBubbleQueue.Count
     $script:completionBubbleHint.Text = if ($remaining -gt 0) { "点击打开对应对话 · 还有 $remaining 条" } else { '点击打开对应对话' }
-    $script:completionBubbleWindow.Topmost = $script:topmostEnabled
+    $script:completionBubbleWindow.Topmost = $false
     $script:completionBubbleWindow.Opacity = [double]$script:windowOpacityPercent / 100.0
     if (-not $script:completionBubbleWindow.IsVisible) { $script:completionBubbleWindow.Show() }
     Update-CompletionBubblePosition
@@ -2040,17 +2160,20 @@ function Check-ProjectCompletionNotifications {
         $key = [string]$project.project_key
         $active = [bool]$project.active
         if ($script:activityStateInitialized -and $script:projectActivityStates.ContainsKey($key) -and
-            [bool]$script:projectActivityStates[$key] -and -not $active -and $script:notifyOnCompletion) {
+            [bool]$script:projectActivityStates[$key] -and -not $active) {
+            Set-ProjectCompletionUnread $project
             if (-not [bool]$Metrics.active -and $script:idleCatFrames.Count -gt 0) {
                 $petSprite.Source = $script:idleCatFrames[0]
                 $petBounce.X = 0
                 $petBounce.Y = 0
             }
-            Queue-CompletionBubble $project
-            $notifyIcon.BalloonTipTitle = 'Codex 任务已完成'
-            $notifyIcon.BalloonTipText = ([string]$project.project_name) + '已从工作中转为待命，双击项目可回到对应任务。'
-            $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-            $notifyIcon.ShowBalloonTip(9000)
+            if ($script:notifyOnCompletion) {
+                Queue-CompletionBubble $project
+                $notifyIcon.BalloonTipTitle = 'Codex 任务已完成'
+                $notifyIcon.BalloonTipText = ([string]$project.project_name) + '已完成但尚未查看，双击项目可回到对应任务。'
+                $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+                $notifyIcon.ShowBalloonTip(9000)
+            }
         }
         $script:projectActivityStates[$key] = $active
     }
@@ -2064,16 +2187,56 @@ $script:calendarGrid = $null
 $script:historySummary = $null
 $script:controlCenterWindow = $null
 $script:controlCenterLoaded = $false
+$script:migrationTasks = @()
 
 function Get-PetBrush {
     param([string]$Color)
     return (New-Object System.Windows.Media.BrushConverter).ConvertFromString($Color)
 }
 
+function Get-PetMaximumContentHeight {
+    try {
+        $handle = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
+        $screen = [System.Windows.Forms.Screen]::FromHandle($handle)
+        $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window)
+        return [Math]::Max(178, [Math]::Min(1200, ([double]$screen.WorkingArea.Height / [double]$dpi.DpiScaleY) - 8))
+    } catch {
+        return [double]900
+    }
+}
+
+function Get-PetContentHeight {
+    param([int]$ProjectCount)
+    if ($ProjectCount -le 0) { return [double]135 }
+    $chromeHeight = if ($script:isCompact) { 163 } else { 213 }
+    $desiredHeight = [double]($chromeHeight + (52 * $ProjectCount))
+    return [Math]::Min((Get-PetMaximumContentHeight), $desiredHeight)
+}
+
 function Apply-PetWindowSize {
-    if ($script:userResized) { return }
-    $window.Width = 240
-    $window.Height = $script:baseWindowHeight
+    param([switch]$FitContent)
+
+    $count = [int]$script:visibleProjectCount
+    $targetHeight = Get-PetContentHeight $count
+    $projectCountChanged = $script:layoutProjectCount -ne $count
+    $shouldFitHeight = -not $script:userResized -or $FitContent -or $projectCountChanged
+    $heightChanged = $false
+
+    if (-not $script:userResized) { $window.Width = 240 }
+    if ($shouldFitHeight -and [Math]::Abs([double]$window.Height - $targetHeight) -ge 0.5) {
+        $window.Height = [Math]::Max([double]$window.MinHeight, $targetHeight)
+        $heightChanged = $true
+    }
+    $script:baseWindowHeight = $targetHeight
+    $script:layoutProjectCount = $count
+    if (-not $script:isPetOnly) {
+        $script:expandedWindowHeight = [double]$window.Height
+        if ($script:userResized -and ($heightChanged -or $projectCountChanged)) {
+            $script:savedWindowHeight = [double]$window.Height
+            Save-PetPosition
+        }
+    }
+    if ($heightChanged) { Keep-PetWindowOnScreen }
 }
 
 function Update-PetWindowLayout {
@@ -2088,7 +2251,6 @@ function Update-PetWindowLayout {
         $detailRow.Height = [System.Windows.GridLength]::new(0)
         $footerPanel.Visibility = 'Collapsed'
         $footerRow.Height = [System.Windows.GridLength]::new(0)
-        $script:baseWindowHeight = 135
         Apply-PetWindowSize
         return
     }
@@ -2104,15 +2266,11 @@ function Update-PetWindowLayout {
         $detailToggleButton.ToolTip = '展开今日累计'
         $detailPanel.Visibility = 'Collapsed'
         $detailRow.Height = [System.Windows.GridLength]::new(0)
-        $autoVisibleCount = [Math]::Min(5, $count)
-        $script:baseWindowHeight = 163 + (52 * $autoVisibleCount)
     } else {
         $detailToggleButton.Content = '⌃'
         $detailToggleButton.ToolTip = '收起今日累计'
         $detailPanel.Visibility = 'Visible'
         $detailRow.Height = [System.Windows.GridLength]::new(50)
-        $autoVisibleCount = [Math]::Min(5, $count)
-        $script:baseWindowHeight = 213 + (52 * $autoVisibleCount)
     }
     Apply-PetWindowSize
 }
@@ -2120,17 +2278,19 @@ function Update-PetWindowLayout {
 function New-ProjectStatusRow {
     param($Project)
 
+    $isUnreadComplete = Test-ProjectCompletionUnread $Project
     $border = New-Object System.Windows.Controls.Border
     $border.Height = 48
     $border.CornerRadius = [System.Windows.CornerRadius]::new(11)
-    $border.Background = Get-PetBrush $(if ($Project.active) { '#182234' } else { '#151A26' })
-    $border.BorderBrush = Get-PetBrush $(if ($Project.active) { '#345F96' } else { '#252D3C' })
-    $border.BorderThickness = [System.Windows.Thickness]::new(1)
+    $border.Background = Get-PetBrush $(if ($Project.active) { '#182234' } elseif ($isUnreadComplete) { '#193029' } else { '#151A26' })
+    $border.BorderBrush = Get-PetBrush $(if ($Project.active) { '#345F96' } elseif ($isUnreadComplete) { '#4FD19A' } else { '#252D3C' })
+    $border.BorderThickness = [System.Windows.Thickness]::new($(if ($isUnreadComplete) { 1.5 } else { 1 }))
     $border.Padding = [System.Windows.Thickness]::new(8,4,4,4)
     $border.Margin = [System.Windows.Thickness]::new(0,0,0,4)
     $border.Tag = $Project
     $border.Cursor = 'Hand'
-    $border.ToolTip = ([string]$Project.project_path) + "`n项目累计 " + (Format-TokenCount $Project.lifetime.total_tokens) + "`n当前会话 " + (Format-TokenCount $Project.session.total_tokens) + "`n双击打开对应 Codex 任务"
+    $unreadTip = if ($isUnreadComplete) { "已完成但尚未查看`n" } else { '' }
+    $border.ToolTip = $unreadTip + ([string]$Project.project_path) + "`n项目累计 " + (Format-TokenCount $Project.lifetime.total_tokens) + "`n当前会话 " + (Format-TokenCount $Project.session.total_tokens) + "`n双击打开对应 Codex 任务"
     $border.Add_MouseLeftButtonDown({
         param($sender, $eventArgs)
         if ($eventArgs.ClickCount -lt 2) { return }
@@ -2140,7 +2300,7 @@ function New-ProjectStatusRow {
             try { $source = [System.Windows.Media.VisualTreeHelper]::GetParent($source) } catch { break }
         }
         $project = $sender.Tag
-        Open-CodexThread ([string]$project.session_id) ([string]$project.project_name)
+        [void](Open-CodexProject $project)
         $eventArgs.Handled = $true
     })
 
@@ -2152,21 +2312,51 @@ function New-ProjectStatusRow {
     $dot = New-Object System.Windows.Shapes.Ellipse
     $dot.Width = 6
     $dot.Height = 6
-    $dot.Fill = Get-PetBrush $(if ($Project.active) { '#4FD19A' } else { '#657086' })
+    $dot.Fill = Get-PetBrush $(if ($Project.active -or $isUnreadComplete) { '#4FD19A' } else { '#657086' })
     $dot.VerticalAlignment = 'Center'
+    if ($isUnreadComplete) {
+        $pulse = New-Object System.Windows.Media.Animation.DoubleAnimation
+        $pulse.From = 0.35
+        $pulse.To = 1.0
+        $pulse.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(850))
+        $pulse.AutoReverse = $true
+        $pulse.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+        $dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $pulse)
+    }
     [System.Windows.Controls.Grid]::SetColumn($dot, 0)
     [void]$grid.Children.Add($dot)
 
     $textPanel = New-Object System.Windows.Controls.StackPanel
     $textPanel.Margin = [System.Windows.Thickness]::new(3,0,2,0)
     [System.Windows.Controls.Grid]::SetColumn($textPanel, 1)
+    $nameHeader = New-Object System.Windows.Controls.Grid
+    [void]$nameHeader.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star) }))
+    [void]$nameHeader.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = [System.Windows.GridLength]::Auto }))
     $nameText = New-Object System.Windows.Controls.TextBlock
     $nameText.Text = [string]$Project.project_name
     $nameText.Foreground = Get-PetBrush '#F1F5FF'
     $nameText.FontSize = 10
     $nameText.FontWeight = 'SemiBold'
     $nameText.TextTrimming = 'CharacterEllipsis'
-    [void]$textPanel.Children.Add($nameText)
+    [void]$nameHeader.Children.Add($nameText)
+    if ($isUnreadComplete) {
+        $unreadBadge = New-Object System.Windows.Controls.Border
+        $unreadBadge.Background = Get-PetBrush '#294D40'
+        $unreadBadge.BorderBrush = Get-PetBrush '#4FD19A'
+        $unreadBadge.BorderThickness = [System.Windows.Thickness]::new(0.7)
+        $unreadBadge.CornerRadius = [System.Windows.CornerRadius]::new(5)
+        $unreadBadge.Padding = [System.Windows.Thickness]::new(4,0,4,0)
+        $unreadBadge.Margin = [System.Windows.Thickness]::new(4,0,0,0)
+        $unreadBadge.VerticalAlignment = 'Center'
+        $unreadText = New-Object System.Windows.Controls.TextBlock
+        $unreadText.Text = '完成未读'
+        $unreadText.Foreground = Get-PetBrush '#8BE3BC'
+        $unreadText.FontSize = 7.5
+        $unreadBadge.Child = $unreadText
+        [System.Windows.Controls.Grid]::SetColumn($unreadBadge, 1)
+        [void]$nameHeader.Children.Add($unreadBadge)
+    }
+    [void]$textPanel.Children.Add($nameHeader)
     $usageText = New-Object System.Windows.Controls.TextBlock
     $normalUsageText = '本轮 ' + (Format-TokenCount $Project.task.total_tokens) + ' · 今日 ' + (Format-TokenCount $Project.today.total_tokens)
     $key = [string]$Project.project_key
@@ -2175,7 +2365,7 @@ function New-ProjectStatusRow {
     }
     $showingLifetime = $script:lifetimeDisplayProjects.ContainsKey($key) -and $script:projectLifetimeTotals.ContainsKey($key)
     $usageText.Text = if ($showingLifetime) { '项目累计 ' + (Format-TokenCount $script:projectLifetimeTotals[$key].total_tokens) } else { $normalUsageText }
-    $usageText.Foreground = Get-PetBrush $(if ($Project.active) { '#68A7FF' } else { '#7F8CA5' })
+    $usageText.Foreground = Get-PetBrush $(if ($Project.active) { '#68A7FF' } elseif ($isUnreadComplete) { '#9BCFB8' } else { '#7F8CA5' })
     $usageText.FontSize = 9
     $usageText.Margin = [System.Windows.Thickness]::new(0,2,0,0)
     $usageText.TextTrimming = 'CharacterEllipsis'
@@ -2290,8 +2480,13 @@ function Render-ProjectRows {
         $statusText.Text = '项目已隐藏 · 新对话会自动出现'
     } else {
         $activeCount = @($visibleProjects | Where-Object { $_.active }).Count
-        $statusText.Text = if ($activeCount -gt 0) {
+        $unreadCount = @($visibleProjects | Where-Object { Test-ProjectCompletionUnread $_ }).Count
+        $statusText.Text = if ($activeCount -gt 0 -and $unreadCount -gt 0) {
+            "$activeCount 个工作中 · $unreadCount 个完成未读"
+        } elseif ($activeCount -gt 0) {
             "$activeCount 个项目工作中 · 共 $($visibleProjects.Count) 个"
+        } elseif ($unreadCount -gt 0) {
+            "$unreadCount 个任务完成未查看"
         } else {
             "$($visibleProjects.Count) 个项目待命"
         }
@@ -2426,7 +2621,7 @@ function Show-HistoryWindow {
         [xml]$historyXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Codex 用量历史" Width="650" Height="650" WindowStyle="None" AllowsTransparency="True"
-        Background="Transparent" ResizeMode="NoResize" Topmost="True" ShowInTaskbar="False" WindowStartupLocation="CenterScreen">
+        Background="Transparent" ResizeMode="NoResize" Topmost="False" ShowInTaskbar="False" WindowStartupLocation="CenterScreen">
   <Border x:Name="HistoryRoot" CornerRadius="24" Background="#F5202634" BorderBrush="#3B82F6" BorderThickness="1.5" Padding="22">
     <Border.Effect><DropShadowEffect Color="#90000000" BlurRadius="25" ShadowDepth="6" Opacity="0.7"/></Border.Effect>
     <Grid>
@@ -2515,9 +2710,9 @@ function Save-ControlCenterSettings {
         $script:autoUpdateEnabled = [bool]$script:autoUpdateCheck.IsChecked
         $window.Topmost = $script:topmostEnabled
         $window.Opacity = [double]$script:windowOpacityPercent / 100.0
-        $script:controlCenterWindow.Topmost = $script:topmostEnabled
+        $script:controlCenterWindow.Topmost = $false
         if ($null -ne $script:completionBubbleWindow) {
-            $script:completionBubbleWindow.Topmost = $script:topmostEnabled
+            $script:completionBubbleWindow.Topmost = $false
             $script:completionBubbleWindow.Opacity = [double]$script:windowOpacityPercent / 100.0
         }
         Start-CompletionBubbleTimer
@@ -2698,18 +2893,360 @@ function Invoke-PetSelfCheck {
     $script:selfCheckSummary.Foreground = Get-PetBrush $(if ($script:checkFail -gt 0) { '#F87171' } elseif ($script:checkWarn -gt 0) { '#FBBF24' } else { '#4FD19A' })
 }
 
+function Get-AllMigrationTasks {
+    Sync-ProjectLifetimeCache
+    $taskByKey = @{}
+    foreach ($entry in @($script:projectLifetimeEntries.Values)) {
+        $sessionPath = [string]$entry.path
+        if ([string]::IsNullOrWhiteSpace($sessionPath) -or -not (Test-Path -LiteralPath $sessionPath)) { continue }
+        $sessionId = [string]$entry.session_id
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-SessionIdFromPath $sessionPath }
+        $taskKey = if (-not [string]::IsNullOrWhiteSpace($sessionId)) { 'thread:' + $sessionId.ToLowerInvariant() } else { 'file:' + $sessionPath.ToLowerInvariant() }
+        $file = Get-Item -LiteralPath $sessionPath -ErrorAction SilentlyContinue
+        if ($null -eq $file) { continue }
+        $modifiedAt = $file.LastWriteTime
+        $projectName = if ([string]::IsNullOrWhiteSpace([string]$entry.project_name)) { '未识别项目' } else { [string]$entry.project_name }
+        $taskTitle = if (-not [string]::IsNullOrWhiteSpace($sessionId) -and $script:threadDescriptions.ContainsKey($sessionId)) {
+            [string]$script:threadDescriptions[$sessionId]
+        } else {
+            $projectName + ' · ' + $modifiedAt.ToString('yyyy-MM-dd HH:mm')
+        }
+        $state = if ($script:sessionStates.ContainsKey($sessionPath)) { $script:sessionStates[$sessionPath] } else { $null }
+        $active = $null -ne $state -and [bool]$state.TaskActive
+        $unread = -not $active -and -not [string]::IsNullOrWhiteSpace($sessionId) -and $script:codexUnreadThreadIds.ContainsKey($sessionId)
+        $candidate = [pscustomobject]@{
+            migration_key = $taskKey
+            task_title = $taskTitle
+            project_key = [string]$entry.project_key
+            project_name = $projectName
+            project_path = [string]$entry.project_path
+            session_id = $sessionId
+            session_path = $sessionPath
+            active = [bool]$active
+            unread = [bool]$unread
+            last_event_at = $modifiedAt.ToString('o')
+            modified_ticks = [int64]$file.LastWriteTimeUtc.Ticks
+            session = [pscustomobject](Copy-UsageBucket $entry.usage)
+            search_text = ($taskTitle + "`n" + $projectName + "`n" + [string]$entry.project_path + "`n" + $sessionId).ToLowerInvariant()
+        }
+        if (-not $taskByKey.ContainsKey($taskKey) -or [int64]$candidate.modified_ticks -gt [int64]$taskByKey[$taskKey].modified_ticks) {
+            $taskByKey[$taskKey] = $candidate
+        }
+    }
+    return @($taskByKey.Values | Sort-Object -Property @{ Expression = { [int64]$_.modified_ticks }; Descending = $true })
+}
+
+function Get-MigrationTaskByKey {
+    param([string]$TaskKey)
+    return @($script:migrationTasks | Where-Object { [string]$_.migration_key -eq $TaskKey } | Select-Object -First 1)[0]
+}
+
+function Sync-MigrationControls {
+    param([switch]$RefreshCatalog)
+    if ($null -eq $script:migrationProjectCombo) { return }
+    $selectedKey = if ($null -ne $script:migrationProjectCombo.SelectedItem) { [string]$script:migrationProjectCombo.SelectedItem.Tag } else { '' }
+    if ($RefreshCatalog -or $null -eq $script:migrationTasks -or $script:migrationTasks.Count -eq 0) {
+        $script:migrationTasks = @(Get-AllMigrationTasks)
+    }
+    $query = if ($null -ne $script:migrationSearchBox) { [string]$script:migrationSearchBox.Text } else { '' }
+    $query = $query.Trim().ToLowerInvariant()
+    $filteredTasks = if ([string]::IsNullOrWhiteSpace($query)) {
+        @($script:migrationTasks)
+    } else {
+        $terms = @($query -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        @($script:migrationTasks | Where-Object {
+            $haystack = [string]$_.search_text
+            $matched = $true
+            foreach ($term in $terms) { if (-not $haystack.Contains($term)) { $matched = $false; break } }
+            $matched
+        })
+    }
+    $filteredTasks = @($filteredTasks)
+    $script:migrationProjectCombo.Items.Clear()
+    foreach ($task in $filteredTasks) {
+        $item = New-Object System.Windows.Controls.ComboBoxItem
+        $stateText = if ([bool]$task.active) { '工作中' } elseif ([bool]$task.unread) { '完成未读' } else { '已完成' }
+        $dateText = ([DateTimeOffset]::Parse([string]$task.last_event_at)).ToLocalTime().ToString('yyyy-MM-dd')
+        $item.Content = ([string]$task.task_title) + ' · ' + ([string]$task.project_name) + ' · ' + $dateText + ' · ' + $stateText
+        $item.ToolTip = ([string]$task.project_path) + "`n会话 ID：" + ([string]$task.session_id)
+        $item.Tag = [string]$task.migration_key
+        [void]$script:migrationProjectCombo.Items.Add($item)
+        if ([string]$task.migration_key -eq $selectedKey) { $script:migrationProjectCombo.SelectedItem = $item }
+    }
+    if ($null -eq $script:migrationProjectCombo.SelectedItem -and $script:migrationProjectCombo.Items.Count -gt 0) {
+        $script:migrationProjectCombo.SelectedIndex = 0
+    }
+    $hasTask = $script:migrationProjectCombo.Items.Count -gt 0
+    $script:exportMigrationButton.IsEnabled = $hasTask
+    $script:exportMigrationButton.Opacity = if ($hasTask) { 1.0 } else { 0.5 }
+    if ($null -ne $script:migrationResultCount) {
+        $script:migrationResultCount.Text = "显示 $($filteredTasks.Count) / 共 $($script:migrationTasks.Count) 条本地任务"
+        $script:migrationResultCount.Foreground = Get-PetBrush $(if ($hasTask) { '#7F8CA5' } else { '#FBBF24' })
+    }
+}
+
+function Get-SafeMigrationName {
+    param([string]$Name)
+    $safe = if ([string]::IsNullOrWhiteSpace($Name)) { 'Codex任务' } else { $Name }
+    foreach ($character in [System.IO.Path]::GetInvalidFileNameChars()) { $safe = $safe.Replace([string]$character, '_') }
+    $safe = $safe.Trim().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($safe)) { return 'Codex任务' }
+    if ($safe.Length -gt 48) { $safe = $safe.Substring(0,48) }
+    return $safe
+}
+
+function Get-SafeGitRemoteUrl {
+    param([string]$RemoteUrl)
+    if ([string]::IsNullOrWhiteSpace($RemoteUrl)) { return '' }
+    return ($RemoteUrl -replace '^(https?://)[^/@]+@', '$1')
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Export-CodexTaskMigration {
+    if ($null -eq $script:migrationProjectCombo.SelectedItem) { return }
+    $taskKey = [string]$script:migrationProjectCombo.SelectedItem.Tag
+    $project = Get-MigrationTaskByKey $taskKey
+    if ($null -eq $project) {
+        $script:migrationStatus.Text = '找不到所选任务，请先刷新后再试'
+        $script:migrationStatus.Foreground = Get-PetBrush '#F87171'
+        return
+    }
+    $sessionPath = [string]$project.session_path
+    if ([string]::IsNullOrWhiteSpace($sessionPath) -or -not (Test-Path -LiteralPath $sessionPath)) {
+        $script:migrationStatus.Text = '所选任务的完整对话日志不存在，无法导出'
+        $script:migrationStatus.Foreground = Get-PetBrush '#F87171'
+        return
+    }
+
+    $script:exportMigrationButton.IsEnabled = $false
+    $script:migrationStatus.Text = '正在整理完整对话和项目状态…'
+    $script:migrationStatus.Foreground = Get-PetBrush '#79AFFF'
+    $script:controlCenterWindow.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+
+    $migrationTempRoot = Join-Path (Join-Path $env:TEMP 'CodexUsagePet\migration-export') ([guid]::NewGuid().ToString('N'))
+    try {
+        $conversationDirectory = Join-Path $migrationTempRoot 'conversation'
+        $gitDirectory = Join-Path $migrationTempRoot 'git'
+        New-Item -ItemType Directory -Path $conversationDirectory -Force | Out-Null
+        New-Item -ItemType Directory -Path $gitDirectory -Force | Out-Null
+
+        $conversationCopy = Join-Path $conversationDirectory 'session.jsonl'
+        Copy-Item -LiteralPath $sessionPath -Destination $conversationCopy -Force
+        $conversationHash = Get-FileSha256 $conversationCopy
+
+        $projectPath = [string]$project.project_path
+        $gitAvailable = $false
+        $gitBranch = ''
+        $gitCommit = ''
+        $gitRemote = ''
+        $gitStatus = ''
+        $bundleIncluded = $false
+        $patchIncluded = $false
+        $gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        $previousGitErrorPreference = $ErrorActionPreference
+        try {
+            # Git uses a non-zero exit code for ordinary cases such as a non-repository
+            # project or a repository without origin. Treat those as optional metadata,
+            # not as a failed task migration.
+            $ErrorActionPreference = 'Continue'
+            if ($null -ne $gitCommand -and -not [string]::IsNullOrWhiteSpace($projectPath) -and (Test-Path -LiteralPath $projectPath -PathType Container)) {
+                $insideWorkTree = (& $gitCommand.Source -C $projectPath rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+                if ($LASTEXITCODE -eq 0 -and $insideWorkTree -eq 'true') {
+                    $gitAvailable = $true
+                    $gitBranch = (& $gitCommand.Source -C $projectPath branch --show-current 2>$null | Out-String).Trim()
+                    $gitCommit = (& $gitCommand.Source -C $projectPath rev-parse HEAD 2>$null | Out-String).Trim()
+                    $gitRemote = Get-SafeGitRemoteUrl ((& $gitCommand.Source -C $projectPath remote get-url origin 2>$null | Out-String).Trim())
+                    $gitStatus = (& $gitCommand.Source -C $projectPath status --short --branch 2>$null | Out-String).TrimEnd()
+                    Set-Content -LiteralPath (Join-Path $gitDirectory 'status.txt') -Value $gitStatus -Encoding UTF8
+
+                    $bundlePath = Join-Path $gitDirectory 'repository.bundle'
+                    & $gitCommand.Source -C $projectPath bundle create $bundlePath HEAD 2>$null | Out-Null
+                    $bundleIncluded = $LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $bundlePath)
+                    if (-not $bundleIncluded -and (Test-Path -LiteralPath $bundlePath)) { Remove-Item -LiteralPath $bundlePath -Force }
+
+                    $patchPath = Join-Path $gitDirectory 'working-tree.patch'
+                    & $gitCommand.Source -C $projectPath diff --binary HEAD ("--output=$patchPath") 2>$null | Out-Null
+                    $patchIncluded = $LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $patchPath) -and (Get-Item -LiteralPath $patchPath).Length -gt 0
+                    if (-not $patchIncluded -and (Test-Path -LiteralPath $patchPath)) { Remove-Item -LiteralPath $patchPath -Force }
+
+                    $untracked = (& $gitCommand.Source -C $projectPath ls-files --others --exclude-standard 2>$null | Out-String).TrimEnd()
+                    Set-Content -LiteralPath (Join-Path $gitDirectory 'untracked-files.txt') -Value $untracked -Encoding UTF8
+                }
+            }
+        } finally {
+            $ErrorActionPreference = $previousGitErrorPreference
+        }
+
+        $exportedAt = [DateTimeOffset]::Now
+        $handoffLines = @(
+            '# Codex 任务迁移说明',
+            '',
+            ('- 任务：' + [string]$project.task_title),
+            ('- 项目：' + [string]$project.project_name),
+            ('- 原电脑项目路径：' + $projectPath),
+            ('- 会话 ID：' + [string]$project.session_id),
+            ('- 最后活动：' + [string]$project.last_event_at),
+            ('- 导出时间：' + $exportedAt.ToString('yyyy-MM-dd HH:mm:ss zzz')),
+            ('- Git 分支：' + $(if ([string]::IsNullOrWhiteSpace($gitBranch)) { '未识别' } else { $gitBranch })),
+            ('- Git 提交：' + $(if ([string]::IsNullOrWhiteSpace($gitCommit)) { '未识别' } else { $gitCommit })),
+            ('- Git 远端：' + $(if ([string]::IsNullOrWhiteSpace($gitRemote)) { '未配置或未识别' } else { $gitRemote })),
+            '',
+            '## 在另一台电脑继续',
+            '',
+            '1. 安装 Codex 并登录自己的同一账号。',
+            '2. 优先从上述 Git 远端克隆项目；没有远端时，可用 `git/repository.bundle` 克隆当前已提交内容。',
+            '3. 若存在 `git/working-tree.patch`，在目标仓库中执行 `git apply --binary working-tree.patch` 恢复已跟踪但未提交的修改。',
+            '4. 查看 `git/untracked-files.txt`；未跟踪文件仅列出名称，不会自动打包，需自行确认后迁移。',
+            '5. 在新电脑的 Codex 中打开项目并创建新任务，让 Codex 先读取本文件和 `conversation/session.jsonl`，然后继续。',
+            '',
+            '## 重要说明',
+            '',
+            '- `conversation/session.jsonl` 是完整原始对话记录，可能包含提示词、命令输出、本地路径和其他隐私。',
+            '- 迁移包不包含 Codex 登录令牌、账户授权文件或桌面宠物设置。',
+            '- 当前没有使用未经官方保证的方式把日志强行写回 Codex 会话目录；导入后会以新任务安全接续。'
+        )
+        Set-Content -LiteralPath (Join-Path $migrationTempRoot 'HANDOFF.md') -Value ($handoffLines -join "`r`n") -Encoding UTF8
+        $continuePrompt = @(
+            '这是从另一台电脑迁移来的 Codex 任务。',
+            '请先完整读取迁移包中的 HANDOFF.md 与 conversation/session.jsonl，理解原对话目标、已经完成的工作、关键决定和剩余事项。',
+            '然后检查当前项目的 Git 分支、提交和工作区是否与 HANDOFF.md 一致；不要重复已经完成的工作。',
+            '先用简短中文告诉我你已恢复了哪些上下文，再从原任务最后未完成的位置继续。'
+        ) -join "`r`n"
+        Set-Content -LiteralPath (Join-Path $migrationTempRoot 'CONTINUE-PROMPT.txt') -Value $continuePrompt -Encoding UTF8
+
+        $manifest = [pscustomobject]@{
+            format = 'codex-usage-pet-task-migration'
+            format_version = 1
+            app_version = $script:appVersion
+            exported_at = $exportedAt.ToString('o')
+            project_key = [string]$project.project_key
+            project_name = [string]$project.project_name
+            task_title = [string]$project.task_title
+            original_project_path = $projectPath
+            session_id = [string]$project.session_id
+            session_file_sha256 = $conversationHash
+            git = [pscustomobject]@{
+                available = $gitAvailable
+                branch = $gitBranch
+                commit = $gitCommit
+                remote = $gitRemote
+                repository_bundle_included = $bundleIncluded
+                working_tree_patch_included = $patchIncluded
+            }
+            contains_complete_conversation = $true
+            contains_credentials = $false
+            untracked_files_included = $false
+        }
+        $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $migrationTempRoot 'manifest.json') -Encoding UTF8
+
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $outputDirectory = Join-Path $desktop 'Codex任务迁移'
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+        $safeName = Get-SafeMigrationName ([string]$project.task_title)
+        $zipPath = Join-Path $outputDirectory ("$safeName-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.zip')
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($migrationTempRoot, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        $script:migrationStatus.Text = '迁移包已导出到桌面：' + [System.IO.Path]::GetFileName($zipPath)
+        $script:migrationStatus.Foreground = Get-PetBrush '#4FD19A'
+        Start-Process -FilePath explorer.exe -ArgumentList ('/select,"{0}"' -f $zipPath)
+    } catch {
+        $script:migrationStatus.Text = '导出失败：' + $_.Exception.Message
+        $script:migrationStatus.Foreground = Get-PetBrush '#F87171'
+    } finally {
+        $script:exportMigrationButton.IsEnabled = $true
+        if (-not [string]::IsNullOrWhiteSpace($migrationTempRoot) -and
+            $migrationTempRoot.StartsWith((Join-Path $env:TEMP 'CodexUsagePet\migration-export'), [System.StringComparison]::OrdinalIgnoreCase) -and
+            (Test-Path -LiteralPath $migrationTempRoot)) {
+            Remove-Item -LiteralPath $migrationTempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Import-CodexTaskMigration {
+    try {
+        $script:migrationStatus.Text = '请选择从另一台电脑带来的迁移包…'
+        $script:migrationStatus.Foreground = Get-PetBrush '#79AFFF'
+        $dialog = New-Object Microsoft.Win32.OpenFileDialog
+        $dialog.Title = '选择 Codex 任务迁移包'
+        $dialog.Filter = 'Codex 任务迁移包 (*.zip)|*.zip'
+        $dialog.CheckFileExists = $true
+        $dialog.Multiselect = $false
+        if ($dialog.ShowDialog($script:controlCenterWindow) -ne $true) {
+            $script:migrationStatus.Text = '已取消导入'
+            $script:migrationStatus.Foreground = Get-PetBrush '#7F8CA5'
+            return
+        }
+        $zipPath = [string]$dialog.FileName
+        $script:migrationStatus.Text = '正在校验并展开迁移包…'
+        $script:migrationStatus.Foreground = Get-PetBrush '#79AFFF'
+        $script:controlCenterWindow.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $importRoot = Join-Path (Join-Path $desktop 'Codex任务迁移') ('已导入-' + (Get-SafeMigrationName ([System.IO.Path]::GetFileNameWithoutExtension($zipPath))) + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType Directory -Path $importRoot -Force | Out-Null
+        $destinationRoot = [System.IO.Path]::GetFullPath($importRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            foreach ($entry in $archive.Entries) {
+                $targetPath = [System.IO.Path]::GetFullPath((Join-Path $importRoot $entry.FullName))
+                if (-not $targetPath.StartsWith($destinationRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw '迁移包包含不安全路径，已停止导入。' }
+                if ([string]::IsNullOrWhiteSpace($entry.Name)) {
+                    New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+                    continue
+                }
+                $targetDirectory = Split-Path -Parent $targetPath
+                New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+                $inputStream = $entry.Open()
+                $outputStream = [System.IO.File]::Open($targetPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                try { $inputStream.CopyTo($outputStream) } finally { $outputStream.Dispose(); $inputStream.Dispose() }
+            }
+        } finally {
+            $archive.Dispose()
+        }
+        $manifestPath = Join-Path $importRoot 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath)) { throw '这不是有效的 Codex 任务迁移包：缺少 manifest.json。' }
+        $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+        if ([string]$manifest.format -ne 'codex-usage-pet-task-migration') { throw '迁移包格式无法识别。' }
+        $conversationPath = Join-Path $importRoot 'conversation\session.jsonl'
+        if (-not (Test-Path -LiteralPath $conversationPath)) { throw '迁移包缺少完整对话日志。' }
+        $actualHash = Get-FileSha256 $conversationPath
+        if ($actualHash -ne [string]$manifest.session_file_sha256) { throw '对话日志校验失败，迁移包可能不完整。' }
+        $script:migrationStatus.Text = '已安全导入并校验；请按 HANDOFF.md 在 Codex 新任务中继续'
+        $script:migrationStatus.Foreground = Get-PetBrush '#4FD19A'
+        $handoffPath = Join-Path $importRoot 'HANDOFF.md'
+        Start-Process explorer.exe $importRoot
+        if (Test-Path -LiteralPath $handoffPath) { Start-Process $handoffPath }
+    } catch {
+        $script:migrationStatus.Text = '导入失败：' + $_.Exception.Message
+        $script:migrationStatus.Foreground = Get-PetBrush '#F87171'
+    }
+}
+
 function Initialize-ControlCenter {
     if ($null -ne $script:controlCenterWindow) { return }
     [xml]$controlXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Codex 助手控制中心" Width="520" Height="610" WindowStyle="None" AllowsTransparency="True"
-        Background="Transparent" ResizeMode="NoResize" Topmost="True" ShowInTaskbar="False" WindowStartupLocation="CenterScreen">
+        Background="Transparent" ResizeMode="NoResize" Topmost="False" ShowInTaskbar="False" WindowStartupLocation="CenterScreen">
   <Border x:Name="ControlRoot" CornerRadius="22" Background="#F5202634" BorderBrush="#4D78B8" BorderThickness="1.5" Padding="18">
     <Border.Effect><DropShadowEffect Color="#90000000" BlurRadius="25" ShadowDepth="6" Opacity="0.7"/></Border.Effect>
     <Grid>
       <Grid.RowDefinitions><RowDefinition Height="48"/><RowDefinition/><RowDefinition Height="34"/></Grid.RowDefinitions>
       <Grid x:Name="ControlHeader">
-        <StackPanel><TextBlock Text="Codex 助手控制中心" Foreground="White" FontSize="18" FontWeight="SemiBold"/><TextBlock Text="排行·设置·诊断" Foreground="#7F8CA5" FontSize="10" Margin="0,3,0,0"/></StackPanel>
+        <StackPanel><TextBlock Text="Codex 助手控制中心" Foreground="White" FontSize="18" FontWeight="SemiBold"/><TextBlock Text="排行·设置·迁移·诊断" Foreground="#7F8CA5" FontSize="10" Margin="0,3,0,0"/></StackPanel>
         <Button x:Name="ControlClose" Content="×" HorizontalAlignment="Right" VerticalAlignment="Top" Width="28" Height="28" Foreground="#AAB6CC" Background="Transparent" BorderThickness="0" FontSize="18" Cursor="Hand"/>
       </Grid>
       <TabControl x:Name="ControlTabs" Grid.Row="1" Background="Transparent" BorderThickness="0" Foreground="#DDE7F7">
@@ -2728,12 +3265,37 @@ function Initialize-ControlCenter {
             <Grid Margin="22,8,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="148"/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock Text="完成气泡停留时间" Foreground="#AEBBD0" VerticalAlignment="Center"/><ComboBox x:Name="CompletionDurationCombo" Grid.Column="1" Height="27"/></Grid>
             <CheckBox x:Name="QuotaCheck" Content="80% / 90% 额度通知" Foreground="#CBD5E8" Margin="0,8,0,0"/>
             <CheckBox x:Name="HealthCheck" Content="主窗口显示数据健康状态" Foreground="#CBD5E8" Margin="0,8,0,0"/>
-            <CheckBox x:Name="TopmostCheck" Content="助手始终置顶" Foreground="#CBD5E8" Margin="0,8,0,0"/>
+            <CheckBox x:Name="TopmostCheck" Content="仅主助手窗口始终置顶" Foreground="#CBD5E8" Margin="0,8,0,0"/>
             <CheckBox x:Name="AutoStartCheck" Content="登录 Windows 后自动启动" Foreground="#CBD5E8" Margin="0,8,0,0"/>
             <CheckBox x:Name="AutoUpdateCheck" Content="每次启动时自动检查更新" Foreground="#CBD5E8" Margin="0,8,0,0"/>
             <StackPanel Orientation="Horizontal" Margin="0,14,0,0"><Button x:Name="SettingsSave" Content="保存并应用" Width="110" Height="32" Background="#3B82F6" Foreground="White" BorderThickness="0" Cursor="Hand"/><Button x:Name="SettingsDefaults" Content="恢复推荐值" Width="100" Height="32" Margin="10,0,0,0" Background="#252E3F" Foreground="#CBD5E8" BorderThickness="0" Cursor="Hand"/><Button x:Name="CheckUpdateButton" Content="检查更新" Width="85" Height="32" Margin="10,0,0,0" Background="#315D91" Foreground="White" BorderThickness="0" Cursor="Hand"/></StackPanel>
             <TextBlock x:Name="SettingsStatus" Foreground="#7F8CA5" FontSize="11" Margin="0,10,0,0"/>
             <TextBlock x:Name="UpdateStatus" Text="更新功能需要连接独立 GitHub 仓库" Foreground="#7F8CA5" FontSize="10" Margin="0,5,0,0" TextWrapping="Wrap"/>
+          </StackPanel></ScrollViewer>
+        </TabItem>
+        <TabItem Header="任务迁移">
+          <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="8,16,8,0">
+            <TextBlock Text="一键迁移到另一台电脑" Foreground="#79AFFF" FontWeight="SemiBold" FontSize="14"/>
+            <TextBlock Text="导出完整对话、Git 提交、当前分支和已跟踪文件的工作区补丁。不会导出登录令牌或账户授权。" Foreground="#AEBBD0" FontSize="11" TextWrapping="Wrap" Margin="0,7,0,0"/>
+            <TextBlock Text="搜索全部本地任务" Foreground="#CBD5E8" Margin="0,16,0,6"/>
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="62"/></Grid.ColumnDefinitions><TextBox x:Name="MigrationSearchBox" Height="30" Padding="8,4" ToolTip="可搜索任务名、项目名、路径或会话 ID"/><Button x:Name="MigrationSearchClear" Grid.Column="1" Content="清空" Height="30" Margin="7,0,0,0" Background="#252E3F" Foreground="#CBD5E8" BorderThickness="0" Cursor="Hand"/></Grid>
+            <TextBlock x:Name="MigrationResultCount" Text="正在读取全部本地任务…" Foreground="#7F8CA5" FontSize="10" Margin="0,6,0,0"/>
+            <TextBlock Text="选择要迁移的任务" Foreground="#CBD5E8" Margin="0,10,0,6"/>
+            <ComboBox x:Name="MigrationProjectCombo" Height="30" MaxDropDownHeight="280" IsTextSearchEnabled="False"/>
+            <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
+              <Button x:Name="ExportMigrationButton" Content="一键导出到桌面" Width="132" Height="34" Background="#2E8B68" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+              <Button x:Name="ImportMigrationButton" Content="导入迁移包" Width="106" Height="34" Margin="10,0,0,0" Background="#315D91" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+            <Border Background="#182130" BorderBrush="#2D3A4D" BorderThickness="1" CornerRadius="10" Padding="12" Margin="0,18,0,0">
+              <StackPanel>
+                <TextBlock Text="迁移包会包含" Foreground="#DDE7F7" FontWeight="SemiBold"/>
+                <TextBlock Text="• 完整原始对话日志（JSONL）&#x0a;• 项目、会话、分支、提交和远端信息&#x0a;• Git 仓库 bundle 与已跟踪文件补丁&#x0a;• HANDOFF 接续说明和可直接使用的继续提示词" Foreground="#93A4BD" FontSize="11" TextWrapping="Wrap" Margin="0,7,0,0"/>
+              </StackPanel>
+            </Border>
+            <Border Background="#30291A" BorderBrush="#6B5524" BorderThickness="1" CornerRadius="10" Padding="12" Margin="0,12,0,0">
+              <TextBlock Text="隐私提醒：完整对话可能含本地路径、命令输出和敏感内容。仅通过可信方式传给自己的另一台电脑。未跟踪文件只列清单，不会自动打包。" Foreground="#E7C77B" FontSize="10.5" TextWrapping="Wrap"/>
+            </Border>
+            <TextBlock x:Name="MigrationStatus" Foreground="#7F8CA5" FontSize="11" Margin="0,14,0,0" TextWrapping="Wrap"/>
           </StackPanel></ScrollViewer>
         </TabItem>
         <TabItem Header="版本与自检">
@@ -2747,7 +3309,7 @@ function Initialize-ControlCenter {
 '@
     $controlReader = New-Object System.Xml.XmlNodeReader $controlXaml
     $script:controlCenterWindow = [Windows.Markup.XamlReader]::Load($controlReader)
-    $script:controlCenterWindow.Topmost = $script:topmostEnabled
+    $script:controlCenterWindow.Topmost = $false
     $root = $script:controlCenterWindow.FindName('ControlRoot')
     $controlHeader = $script:controlCenterWindow.FindName('ControlHeader')
     $close = $script:controlCenterWindow.FindName('ControlClose')
@@ -2768,6 +3330,13 @@ function Initialize-ControlCenter {
     $script:autoUpdateCheck = $script:controlCenterWindow.FindName('AutoUpdateCheck')
     $script:settingsStatus = $script:controlCenterWindow.FindName('SettingsStatus')
     $script:updateStatus = $script:controlCenterWindow.FindName('UpdateStatus')
+    $script:migrationSearchBox = $script:controlCenterWindow.FindName('MigrationSearchBox')
+    $script:migrationSearchClear = $script:controlCenterWindow.FindName('MigrationSearchClear')
+    $script:migrationResultCount = $script:controlCenterWindow.FindName('MigrationResultCount')
+    $script:migrationProjectCombo = $script:controlCenterWindow.FindName('MigrationProjectCombo')
+    $script:exportMigrationButton = $script:controlCenterWindow.FindName('ExportMigrationButton')
+    $script:importMigrationButton = $script:controlCenterWindow.FindName('ImportMigrationButton')
+    $script:migrationStatus = $script:controlCenterWindow.FindName('MigrationStatus')
     $script:selfCheckSummary = $script:controlCenterWindow.FindName('SelfCheckSummary')
     $script:selfCheckPanel = $script:controlCenterWindow.FindName('SelfCheckPanel')
     foreach ($seconds in @(2,5,10,30)) { Add-ComboChoice $script:refreshCombo "$seconds 秒" ([string]$seconds) }
@@ -2796,6 +3365,10 @@ function Initialize-ControlCenter {
         $script:settingsStatus.Text = '已填入推荐值，点击“保存并应用”生效'
     })
     $script:controlCenterWindow.FindName('CheckUpdateButton').Add_Click({ Start-PetUpdateCheck })
+    $script:migrationSearchBox.Add_TextChanged({ Sync-MigrationControls })
+    $script:migrationSearchClear.Add_Click({ $script:migrationSearchBox.Clear(); $script:migrationSearchBox.Focus() })
+    $script:exportMigrationButton.Add_Click({ Export-CodexTaskMigration })
+    $script:importMigrationButton.Add_Click({ Import-CodexTaskMigration })
     $script:controlCenterWindow.FindName('RunSelfCheck').Add_Click({ Invoke-PetSelfCheck })
     $script:controlTabs.Add_SelectionChanged({
         param($sender, $eventArgs)
@@ -2803,7 +3376,8 @@ function Initialize-ControlCenter {
         if ($eventArgs.OriginalSource -ne $script:controlTabs) { return }
         if ($script:controlTabs.SelectedIndex -eq 0) { Render-ControlCenter }
         elseif ($script:controlTabs.SelectedIndex -eq 1) { Sync-SettingsControls }
-        elseif ($script:controlTabs.SelectedIndex -eq 2) { Invoke-PetSelfCheck }
+        elseif ($script:controlTabs.SelectedIndex -eq 2) { Sync-MigrationControls -RefreshCatalog }
+        elseif ($script:controlTabs.SelectedIndex -eq 3) { Invoke-PetSelfCheck }
     })
     $script:controlCenterLoaded = $true
 }
@@ -2811,11 +3385,12 @@ function Initialize-ControlCenter {
 function Show-ControlCenter {
     param([int]$TabIndex = 0)
     Initialize-ControlCenter
-    $script:controlTabs.SelectedIndex = [Math]::Max(0, [Math]::Min(2, $TabIndex))
+    $script:controlTabs.SelectedIndex = [Math]::Max(0, [Math]::Min(3, $TabIndex))
     if (-not $script:controlCenterWindow.IsVisible) { $script:controlCenterWindow.Show() }
     $script:controlCenterWindow.Activate()
     if ($TabIndex -eq 0) { Render-ControlCenter }
     elseif ($TabIndex -eq 1) { Sync-SettingsControls }
+    elseif ($TabIndex -eq 2) { Sync-MigrationControls -RefreshCatalog }
     else { Invoke-PetSelfCheck }
 }
 
@@ -3092,6 +3667,7 @@ function Register-PetResizeThumb {
         }
         $script:savedWindowWidth = $window.Width
         $script:savedWindowHeight = $window.Height
+        $script:layoutProjectCount = [int]$script:visibleProjectCount
         Save-PetPosition
         $statusText.Text = ('窗口大小已保存 · {0:0} × {1:0}' -f $window.Width, $window.Height)
     })
@@ -3110,7 +3686,7 @@ $resizeBottomRight.Add_PreviewMouseLeftButtonDown({
     if ($script:isPetOnly) { return }
     if ($eventArgs.ClickCount -ge 2) {
         $script:userResized = $false
-        Apply-PetWindowSize
+        Apply-PetWindowSize -FitContent
         Save-PetPosition
         $statusText.Text = '窗口已恢复为自动大小'
         $eventArgs.Handled = $true
@@ -3126,6 +3702,7 @@ $showItem = $trayMenu.Items.Add('显示 / 隐藏')
 $historyItem = $trayMenu.Items.Add('用量历史')
 $rankingItem = $trayMenu.Items.Add('项目用量排行')
 $settingsItem = $trayMenu.Items.Add('设置')
+$migrationItem = $trayMenu.Items.Add('一键迁移任务')
 $selfCheckItem = $trayMenu.Items.Add('版本与自检')
 $showAllProjectsItem = $trayMenu.Items.Add('恢复隐藏项目')
 $refreshItem = $trayMenu.Items.Add('立即刷新（账户 + 本机）')
@@ -3141,6 +3718,8 @@ $showAction = {
     if ($window.WindowState -eq 'Minimized') {
         $window.WindowState = 'Normal'
         if (-not $window.IsVisible) { $window.Show() }
+        Update-PetUi
+        Apply-PetWindowSize -FitContent
         $window.Activate()
         Show-NextCompletionBubble
     } elseif ($window.IsVisible) {
@@ -3150,6 +3729,8 @@ $showAction = {
     } else {
         $window.WindowState = 'Normal'
         $window.Show()
+        Update-PetUi
+        Apply-PetWindowSize -FitContent
         $window.Activate()
         Show-NextCompletionBubble
     }
@@ -3159,7 +3740,8 @@ $notifyIcon.Add_DoubleClick($showAction)
 $historyItem.Add_Click({ Show-HistoryWindow })
 $rankingItem.Add_Click({ Show-ControlCenter 0 })
 $settingsItem.Add_Click({ Show-ControlCenter 1 })
-$selfCheckItem.Add_Click({ Show-ControlCenter 2 })
+$migrationItem.Add_Click({ Show-ControlCenter 2 })
+$selfCheckItem.Add_Click({ Show-ControlCenter 3 })
 $showAllProjectsItem.Add_Click({ Restore-AllProjectRows })
 $refreshItem.Add_Click({ Invoke-ManualPetRefresh })
 $exitItem.Add_Click({
@@ -3200,6 +3782,8 @@ $wakeTimer.Add_Tick({
     if ($script:showExistingEvent.WaitOne(0)) {
         if (-not $window.IsVisible) { $window.Show() }
         $window.WindowState = 'Normal'
+        Update-PetUi
+        Apply-PetWindowSize -FitContent
         $window.Activate()
         $window.Topmost = $false
         $window.Topmost = $true
@@ -3246,9 +3830,9 @@ $petAnimationTimer.Interval = [TimeSpan]::FromMilliseconds((Get-PetAnimationMill
 $petAnimationTimer.Add_Tick({ Update-PetAnimation })
 
 $window.Add_Loaded({
-    Apply-PetWindowSize
     Initialize-ControlCenter
     Update-PetUi
+    Apply-PetWindowSize -FitContent
     Update-PetAnimation
     if ($script:startPetOnly) { Set-PetOnlyMode $true $false }
     $refreshTimer.Start()
